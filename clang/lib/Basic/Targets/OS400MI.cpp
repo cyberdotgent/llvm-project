@@ -16,4 +16,6 @@ void OS400MITargetInfo::getTargetDefines(const LangOptions &Opts,
                                          MacroBuilder &Builder) const {
   Builder.defineMacro("__OS400MI__");
   Builder.defineMacro("__os400mi__");
+  Builder.defineMacro("__OS400__");
+  Builder.defineMacro("__os400__");
 }

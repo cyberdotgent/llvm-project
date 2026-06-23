@@ -229,6 +229,7 @@ public:
     UEFI,
     Win32,
     ZOS,
+    OS400,
     Haiku,
     RTEMS,
     AIX,
@@ -770,6 +771,9 @@ public:
 
   /// Tests whether the OS is AIX.
   bool isOSAIX() const { return getOS() == Triple::AIX; }
+
+  /// Tests whether the OS is OS/400.
+  bool isOS400() const { return getOS() == Triple::OS400; }
 
   bool isOSSerenity() const { return getOS() == Triple::Serenity; }
 

@@ -454,6 +454,8 @@ StringRef Triple::getOSTypeName(OSType Kind) {
     return "netbsd";
   case OpenBSD:
     return "openbsd";
+  case OS400:
+    return "os400";
   case PS4:
     return "ps4";
   case PS5:
@@ -941,6 +943,7 @@ static Triple::OSType parseOS(StringRef OSName) {
       .StartsWith("win32", Triple::Win32)
       .StartsWith("windows", Triple::Win32)
       .StartsWith("zos", Triple::ZOS)
+      .StartsWith("os400", Triple::OS400)
       .StartsWith("haiku", Triple::Haiku)
       .StartsWith("rtems", Triple::RTEMS)
       .StartsWith("aix", Triple::AIX)

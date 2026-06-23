@@ -15,6 +15,7 @@
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -24,6 +25,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
@@ -45,7 +47,9 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/TargetParser/Triple.h"
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -291,6 +295,97 @@ class OS400MIEmitPass : public ModulePass {
     return static_cast<uint32_t>(Width);
   }
 
+  static uint32_t getABIAlignment(const DataLayout &DL, Type *Ty) {
+    return static_cast<uint32_t>(DL.getABITypeAlign(Ty).value());
+  }
+
+  static void storeIntegerBytes(const APInt &Value, uint64_t Size,
+                                MutableArrayRef<uint8_t> Dest) {
+    APInt Bytes = Value.zextOrTrunc(Size * 8);
+    for (uint64_t I = 0; I != Size; ++I)
+      Dest[I] = static_cast<uint8_t>(
+          Bytes.lshr((Size - I - 1) * 8).getZExtValue() & 0xFF);
+  }
+
+  static bool isSupportedArenaAggregateType(Type *Ty) {
+    if (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) || Ty->isIntegerTy(32))
+      return true;
+
+    if (const auto *AT = dyn_cast<ArrayType>(Ty))
+      return isSupportedArenaAggregateType(AT->getElementType());
+
+    if (const auto *ST = dyn_cast<StructType>(Ty)) {
+      for (Type *EltTy : ST->elements()) {
+        if (!isSupportedArenaAggregateType(EltTy))
+          return false;
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  static std::string getRawHex(ArrayRef<uint8_t> Bytes) {
+    const char Digits[] = "0123456789ABCDEF";
+    std::string Hex;
+    Hex.reserve(Bytes.size() * 2);
+    for (uint8_t Byte : Bytes) {
+      Hex.push_back(Digits[Byte >> 4]);
+      Hex.push_back(Digits[Byte & 0x0F]);
+    }
+    return Hex;
+  }
+
+  static void writeConstantBytes(const DataLayout &DL, const Constant *C,
+                                 MutableArrayRef<uint8_t> Bytes) {
+    if (isa<UndefValue>(C) || isa<ConstantAggregateZero>(C)) {
+      std::fill(Bytes.begin(), Bytes.end(), 0);
+      return;
+    }
+
+    if (const auto *CI = dyn_cast<ConstantInt>(C)) {
+      if (!(CI->getType()->isIntegerTy(8) || CI->getType()->isIntegerTy(16) ||
+            CI->getType()->isIntegerTy(32)))
+        fail("i8/i16/i32 integer aggregate constants");
+      storeIntegerBytes(CI->getValue(), Bytes.size(), Bytes);
+      return;
+    }
+
+    Type *Ty = C->getType();
+    if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+      uint64_t EltSize = DL.getTypeAllocSize(AT->getElementType());
+      for (uint64_t I = 0, E = AT->getNumElements(); I != E; ++I) {
+        const Constant *Elt =
+            isa<ConstantAggregateZero>(C) || isa<UndefValue>(C)
+                ? Constant::getNullValue(AT->getElementType())
+                : C->getAggregateElement(static_cast<unsigned>(I));
+        if (!Elt)
+          fail("constant integer array elements");
+        writeConstantBytes(DL, Elt, Bytes.slice(I * EltSize, EltSize));
+      }
+      return;
+    }
+
+    if (auto *ST = dyn_cast<StructType>(Ty)) {
+      const StructLayout *Layout = DL.getStructLayout(ST);
+      for (unsigned I = 0, E = ST->getNumElements(); I != E; ++I) {
+        Type *EltTy = ST->getElementType(I);
+        uint64_t EltSize = DL.getTypeAllocSize(EltTy);
+        const Constant *Elt =
+            isa<ConstantAggregateZero>(C) || isa<UndefValue>(C)
+                ? Constant::getNullValue(EltTy)
+                : C->getAggregateElement(I);
+        if (!Elt)
+          fail("constant integer struct elements");
+        writeConstantBytes(DL, Elt,
+                           Bytes.slice(Layout->getElementOffset(I), EltSize));
+      }
+      return;
+    }
+
+    fail("integer array/struct aggregate constants");
+  }
+
   struct ArenaSlot {
     std::string Name;
     uint32_t Offset = 0;
@@ -394,6 +489,7 @@ class OS400MIEmitPass : public ModulePass {
     };
 
     NameAllocator Names;
+    const DataLayout &DL;
     DenseMap<const GlobalVariable *, GlobalObject> Globals;
     SmallVector<std::string, 8> Declarations;
     SmallVector<MapRecord, 8> MapRecords;
@@ -509,6 +605,61 @@ class OS400MIEmitPass : public ModulePass {
       llvm_unreachable("fail should not return");
     }
 
+    static bool canEncodeCP37Byte(uint8_t Byte) {
+      if (Byte == 0 || Byte == '\t' || Byte == '\n' || Byte == '\r')
+        return true;
+      if ((Byte >= '0' && Byte <= '9') || (Byte >= 'A' && Byte <= 'Z') ||
+          (Byte >= 'a' && Byte <= 'z'))
+        return true;
+
+      switch (Byte) {
+      case ' ':
+      case '!':
+      case '"':
+      case '#':
+      case '$':
+      case '%':
+      case '&':
+      case '\'':
+      case '(':
+      case ')':
+      case '*':
+      case '+':
+      case ',':
+      case '-':
+      case '.':
+      case '/':
+      case ':':
+      case ';':
+      case '<':
+      case '=':
+      case '>':
+      case '?':
+      case '@':
+      case '[':
+      case '\\':
+      case ']':
+      case '^':
+      case '_':
+      case '`':
+      case '{':
+      case '|':
+      case '}':
+      case '~':
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    static bool isCP37StringLiteral(const ConstantDataArray &CDA) {
+      if (!CDA.isCString())
+        return false;
+
+      StringRef Bytes = CDA.getAsString();
+      return llvm::all_of(Bytes.bytes(), canEncodeCP37Byte);
+    }
+
     static std::string encodeCP37Hex(StringRef Bytes) {
       std::string Hex;
       const char Digits[] = "0123456789ABCDEF";
@@ -620,8 +771,36 @@ class OS400MIEmitPass : public ModulePass {
       NextArenaOffset = Offset + Size;
     }
 
+    void layoutAggregateGlobal(const GlobalVariable &GV) {
+      Type *ValueTy = GV.getValueType();
+      if (!isSupportedArenaAggregateType(ValueTy))
+        fail("integer array/struct globals");
+
+      uint32_t Size = static_cast<uint32_t>(DL.getTypeAllocSize(ValueTy));
+      uint32_t Alignment = getABIAlignment(DL, ValueTy);
+      uint32_t Offset = alignTo(NextArenaOffset, Alignment);
+      if (Offset + Size > ArenaSize)
+        fail("phase-1 arena storage within 256 bytes");
+
+      SmallVector<uint8_t, 32> Bytes(Size, 0);
+      writeConstantBytes(DL, GV.getInitializer(), Bytes);
+
+      std::string Original = getOriginalName(GV);
+      GeneratedName Name = Names.createGlobalName(Original);
+      Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
+                             std::to_string(Size) +
+                             ")    DEF(C_MEM) POS(" +
+                             std::to_string(Offset + 1) + ") INIT(X'" +
+                             getRawHex(Bytes) + "');");
+      addGlobalObject(GV, Name, "aggregate", Offset, Size, Alignment,
+                      AccessWidth::I8, false);
+      addMapRecord(Name, "aggregate", std::move(Original), Offset, Size,
+                   Alignment, getSourceLocation(GV), "raw-bytes");
+      NextArenaOffset = Offset + Size;
+    }
+
   public:
-    explicit ArenaLayout(const DataLayout &) {}
+    explicit ArenaLayout(const DataLayout &DL) : DL(DL) {}
 
     void lower(const Module &M) {
       for (const GlobalVariable &GV : M.globals()) {
@@ -637,12 +816,22 @@ class OS400MIEmitPass : public ModulePass {
 
         const auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
         const auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
-        if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA) {
+        if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA &&
+            isCP37StringLiteral(*CDA)) {
           layoutStringGlobal(GV, *CDA);
           continue;
         }
 
-        fail("i8/i16/i32 globals and constant i8 string globals");
+        if (isa<ConstantAggregateZero>(GV.getInitializer()) ||
+            isa<ConstantArray>(GV.getInitializer()) ||
+            isa<ConstantStruct>(GV.getInitializer()) ||
+            isa<ConstantDataArray>(GV.getInitializer())) {
+          layoutAggregateGlobal(GV);
+          continue;
+        }
+
+        fail("i8/i16/i32 globals, constant i8 string globals, and integer "
+             "array/struct globals");
       }
     }
 
@@ -674,6 +863,7 @@ class OS400MIEmitPass : public ModulePass {
     const DataLayout &DL;
     const ArenaLayout &Layout;
     DenseMap<const Value *, std::string> Values;
+    DenseMap<const Value *, std::string> SignedNarrowValues;
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
     DenseMap<const BasicBlock *, std::string> BlockLabels;
@@ -698,6 +888,9 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
+    static uint32_t alignTo(uint32_t Value, uint32_t Alignment) {
+      return (Value + Alignment - 1) & ~(Alignment - 1);
+    }
 
     static std::string getOriginalName(const Value &V) {
       if (V.hasName())
@@ -745,15 +938,47 @@ class OS400MIEmitPass : public ModulePass {
       return It->second;
     }
 
-    std::string getCompareOperandName(const Value *V) const {
+    std::string getCompareOperandName(const Value *V, bool Signed = false) {
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
         Type *Ty = CI->getType();
+        if (Signed && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16)))
+          return std::to_string(static_cast<int32_t>(CI->getSExtValue()));
         if (Ty->isIntegerTy(8))
           return std::to_string(CI->getZExtValue() & 0xFF);
         if (Ty->isIntegerTy(16))
           return std::to_string(CI->getZExtValue() & 0xFFFF);
       }
+      if (Signed && (V->getType()->isIntegerTy(8) ||
+                     V->getType()->isIntegerTy(16)))
+        return materializeSignedNarrowOperand(V);
       return getOperandName(V);
+    }
+
+    std::string materializeSignedNarrowOperand(const Value *V) {
+      auto Existing = SignedNarrowValues.find(V);
+      if (Existing != SignedNarrowValues.end())
+        return Existing->second;
+
+      Type *Ty = V->getType();
+      if (!Ty->isIntegerTy(8) && !Ty->isIntegerTy(16))
+        fail("signed i8/i16 compare operands");
+
+      std::string Src = getOperandName(V);
+      std::string Dest = createAnonymousTemp("signed_narrow");
+      GeneratedName DoneName = Names.createBlockName();
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(DoneName, "signed_narrow_done", "", std::nullopt);
+
+      uint32_t SignLimit = Ty->isIntegerTy(8) ? 127 : 32767;
+      uint32_t Modulus = Ty->isIntegerTy(8) ? 256 : 65536;
+      Body.push_back("        CPYNV       " + Dest + "," + Src + ";");
+      Body.push_back("        CMPNV(B)    " + Src + "," +
+                     std::to_string(SignLimit) + "/NHI(" + DoneLabel + ");");
+      Body.push_back("        SUBN        " + Dest + "," + Src + "," +
+                     std::to_string(Modulus) + ";");
+      Body.push_back(DoneLabel + ":");
+      SignedNarrowValues[V] = Dest;
+      return Dest;
     }
 
     std::string getBlockLabel(const BasicBlock *BB) const {
@@ -881,7 +1106,7 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerAlloca(const AllocaInst &AI) {
       if (AI.isArrayAllocation())
-        fail("static scalar or i32-array allocas");
+        fail("static scalar or integer aggregate allocas");
 
       Type *AllocatedTy = AI.getAllocatedType();
       bool ScalarInt = isSupportedInt(AllocatedTy);
@@ -890,16 +1115,16 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Size = 0;
       if (ScalarInt) {
         Size = getAccessWidthBytes(Width);
-      } else if (const auto *AT = dyn_cast<ArrayType>(AllocatedTy)) {
-        Type *EltTy = AT->getElementType();
-        if (!isSupportedInt(EltTy))
-          fail("static scalar or integer-array allocas");
-        Size = AT->getNumElements() * EltTy->getIntegerBitWidth() / 8;
+      } else if (isSupportedArenaAggregateType(AllocatedTy)) {
+        Size = static_cast<uint32_t>(DL.getTypeAllocSize(AllocatedTy));
       } else {
-        fail("static scalar or integer-array allocas");
+        fail("static scalar or integer aggregate allocas");
       }
 
-      uint32_t Offset = alignTo4(NextArenaOffset);
+      uint32_t Alignment = ScalarInt ? 4 : getABIAlignment(DL, AllocatedTy);
+      uint32_t Offset =
+          ScalarInt ? alignTo4(NextArenaOffset)
+                    : static_cast<uint32_t>(alignTo(NextArenaOffset, Alignment));
       if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
@@ -923,7 +1148,7 @@ class OS400MIEmitPass : public ModulePass {
                                std::to_string(Slot.Offset + 1) + ");");
       }
       addMapRecord(SlotName, "local", std::move(Original),
-                   getSourceLocation(AI), Slot.Offset, Size, 4);
+                   getSourceLocation(AI), Slot.Offset, Size, Alignment);
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
@@ -954,12 +1179,11 @@ class OS400MIEmitPass : public ModulePass {
       if (!isSupportedCompareInt(ICI.getOperand(0)->getType()) ||
           ICI.getOperand(0)->getType() != ICI.getOperand(1)->getType())
         fail("i8/i16/i32 icmp expressions");
-      if (!ICI.getOperand(0)->getType()->isIntegerTy(32) && ICI.isSigned())
-        fail("signed i8/i16 icmp expressions after sext to i32");
 
-      Comparisons[&ICI] = {ICI.getPredicate(),
-                           getCompareOperandName(ICI.getOperand(0)),
-                           getCompareOperandName(ICI.getOperand(1))};
+      Comparisons[&ICI] = {
+          ICI.getPredicate(),
+          getCompareOperandName(ICI.getOperand(0), ICI.isSigned()),
+          getCompareOperandName(ICI.getOperand(1), ICI.isSigned())};
     }
 
     std::string materializeBoolean(const Value *V) {
@@ -1220,13 +1444,26 @@ class OS400MIEmitPass : public ModulePass {
 
     void emitSetLensPointer(const Value *Ptr) {
       ensureLoadStoreLens();
-      Body.push_back("        CPYNV       OFF," + getPointerOffsetName(Ptr) +
-                     ";");
+      emitSetLensPointerFromOffset(getPointerOffsetName(Ptr));
+    }
+
+    void emitSetLensPointerFromOffset(StringRef Offset) {
+      ensureLoadStoreLens();
+      Body.push_back("        CPYNV       OFF," + Offset.str() + ";");
       Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+    }
+
+    std::string getPointerOffsetPlus(StringRef Base, uint64_t Offset) {
+      return addStaticOffset("ptr_offset", Base, Offset);
     }
 
     static std::string getByteHex(const ConstantInt &CI) {
       uint32_t Byte = CI.getZExtValue() & 0xFF;
+      return getByteHex(Byte);
+    }
+
+    static std::string getByteHex(uint32_t Byte) {
+      Byte &= 0xFF;
       const char Digits[] = "0123456789ABCDEF";
       std::string Hex;
       Hex.push_back(Digits[Byte >> 4]);
@@ -1234,8 +1471,94 @@ class OS400MIEmitPass : public ModulePass {
       return Hex;
     }
 
+    std::optional<SmallVector<uint8_t, 32>>
+    getConstantStoreBytes(const Value *V) const {
+      auto *C = dyn_cast<Constant>(V);
+      if (!C || !isSupportedArenaAggregateType(C->getType()))
+        return std::nullopt;
+
+      uint64_t Size = DL.getTypeAllocSize(C->getType());
+      if (Size > std::numeric_limits<uint32_t>::max())
+        fail("phase-1 aggregate store size");
+
+      SmallVector<uint8_t, 32> Bytes(Size, 0);
+      writeConstantBytes(DL, C, Bytes);
+      return Bytes;
+    }
+
+    void emitStoreByteToPointer(StringRef PtrOffset, uint64_t ByteOffset,
+                                uint8_t Byte) {
+      emitSetLensPointerFromOffset(getPointerOffsetPlus(PtrOffset, ByteOffset));
+      Body.push_back("        CPYBLA      LS_I1,X'" + getByteHex(Byte) + "';");
+    }
+
+    void emitStoreBytesToPointer(const Value *Ptr, ArrayRef<uint8_t> Bytes) {
+      std::string Base = getPointerOffsetName(Ptr);
+      for (uint64_t I = 0, E = Bytes.size(); I != E; ++I)
+        emitStoreByteToPointer(Base, I, Bytes[I]);
+    }
+
+    void emitCopyBytes(const Value *DestPtr, const Value *SourcePtr,
+                       uint64_t Size) {
+      std::string DestBase = getPointerOffsetName(DestPtr);
+      std::string SourceBase = getPointerOffsetName(SourcePtr);
+      ensureU1Box();
+      for (uint64_t I = 0; I != Size; ++I) {
+        emitSetLensPointerFromOffset(getPointerOffsetPlus(SourceBase, I));
+        Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+        emitSetLensPointerFromOffset(getPointerOffsetPlus(DestBase, I));
+        Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      }
+    }
+
+    void emitFillBytes(const Value *DestPtr, uint64_t Size, const Value *Byte) {
+      std::string DestBase = getPointerOffsetName(DestPtr);
+      std::optional<std::string> ConstantHex;
+      if (const auto *CI = dyn_cast<ConstantInt>(Byte))
+        ConstantHex = getByteHex(*CI);
+      else {
+        ensureU1Box();
+        Body.push_back("        CPYNV       U1_NUM," + getOperandName(Byte) +
+                       ";");
+      }
+
+      for (uint64_t I = 0; I != Size; ++I) {
+        emitSetLensPointerFromOffset(getPointerOffsetPlus(DestBase, I));
+        if (ConstantHex)
+          Body.push_back("        CPYBLA      LS_I1,X'" + *ConstantHex + "';");
+        else
+          Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      }
+    }
+
+    static uint64_t getConstantLength(const Value *V) {
+      const auto *CI = dyn_cast<ConstantInt>(V);
+      if (!CI)
+        fail("constant byte counts for aggregate memory operations");
+      return CI->getZExtValue();
+    }
+
+    void lowerMemCpy(const MemCpyInst &MI) {
+      uint64_t Size = getConstantLength(MI.getLength());
+      emitCopyBytes(MI.getDest(), MI.getSource(), Size);
+    }
+
+    void lowerMemSet(const MemSetInst &MI) {
+      uint64_t Size = getConstantLength(MI.getLength());
+      emitFillBytes(MI.getDest(), Size, MI.getValue());
+    }
+
     void lowerStore(const StoreInst &SI) {
       Type *ValueTy = SI.getValueOperand()->getType();
+      if (!isSupportedInt(ValueTy)) {
+        std::optional<SmallVector<uint8_t, 32>> Bytes =
+            getConstantStoreBytes(SI.getValueOperand());
+        if (!Bytes)
+          fail("constant integer aggregate stores");
+        emitStoreBytesToPointer(SI.getPointerOperand(), *Bytes);
+        return;
+      }
+
       AccessWidth Width = getAccessWidth(ValueTy);
       if (std::optional<ArenaSlot> Slot =
               getDirectScalarSlot(SI.getPointerOperand())) {
@@ -1424,6 +1747,10 @@ class OS400MIEmitPass : public ModulePass {
             lowerStore(*SI);
           } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
             lowerLoad(*LI);
+          } else if (const auto *MI = dyn_cast<MemCpyInst>(&I)) {
+            lowerMemCpy(*MI);
+          } else if (const auto *MI = dyn_cast<MemSetInst>(&I)) {
+            lowerMemSet(*MI);
           } else if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
             lowerReturn(*RI);
             SawTerminator = true;
@@ -1435,7 +1762,7 @@ class OS400MIEmitPass : public ModulePass {
             SawTerminator = true;
           } else {
             fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/sext/select/"
-                 "phi, branch, and ret instructions");
+                 "phi, memcpy, memset, branch, and ret instructions");
           }
         }
 

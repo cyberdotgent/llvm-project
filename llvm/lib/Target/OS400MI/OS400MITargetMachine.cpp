@@ -143,27 +143,6 @@ class OS400MIEmitPass : public ModulePass {
     OS << '"';
   }
 
-  static const Function &getMainFunction(const Module &M) {
-    const Function *Main = M.getFunction("main");
-    if (!Main || Main->isDeclaration())
-      fail("a defined i32 main function");
-
-    FunctionType *MainTy = Main->getFunctionType();
-    if (!MainTy->getReturnType()->isIntegerTy(32) ||
-        MainTy->getNumParams() != 0)
-      fail("int main(void)");
-
-    for (const Function &F : M.functions()) {
-      if (!F.isDeclaration() && &F != Main)
-        fail("only one defined function named main");
-    }
-
-    if (Main->empty())
-      fail("a defined i32 main function");
-
-    return *Main;
-  }
-
   struct SourceLocationRecord {
     std::string File;
     std::optional<unsigned> Line;
@@ -186,6 +165,7 @@ class OS400MIEmitPass : public ModulePass {
     unsigned NextSlot = 1;
     unsigned NextTemp = 1;
     unsigned NextBlock = 1;
+    unsigned NextFunction = 1;
     unsigned NextGlobal = 1;
     unsigned NextLiteral = 1;
     unsigned NextHelper = 1;
@@ -215,6 +195,8 @@ class OS400MIEmitPass : public ModulePass {
         return NextTemp;
       if (Class == "label")
         return NextBlock;
+      if (Class == "function")
+        return NextFunction;
       if (Class == "global")
         return NextGlobal;
       if (Class == "literal")
@@ -254,6 +236,12 @@ class OS400MIEmitPass : public ModulePass {
   public:
     static constexpr unsigned getMaxMINameLength() { return MaxMINameLength; }
 
+    void reserveName(StringRef Name) {
+      if (Name.size() > MaxMINameLength)
+        fail("reserved MI names no longer than 48 characters");
+      UsedNames.insert(Name.str());
+    }
+
     GeneratedName createSlotName(StringRef Original = "") {
       return allocate("local", "S", Original);
     }
@@ -264,6 +252,10 @@ class OS400MIEmitPass : public ModulePass {
 
     GeneratedName createBlockName(StringRef Original = "") {
       return allocate("label", "B", Original);
+    }
+
+    GeneratedName createFunctionName(StringRef Original = "") {
+      return allocate("function", "F", Original);
     }
 
     GeneratedName createGlobalName(StringRef Original = "") {
@@ -511,7 +503,7 @@ class OS400MIEmitPass : public ModulePass {
       bool DirectScalar = false;
     };
 
-    NameAllocator Names;
+    NameAllocator &Names;
     const DataLayout &DL;
     DenseMap<const GlobalVariable *, GlobalObject> Globals;
     SmallVector<std::string, 8> Declarations;
@@ -929,7 +921,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
   public:
-    explicit ArenaLayout(const DataLayout &DL) : DL(DL) {}
+    explicit ArenaLayout(const DataLayout &DL, NameAllocator &Names)
+        : Names(Names), DL(DL) {}
 
     void lower(const Module &M) {
       for (const GlobalVariable &GV : M.globals()) {
@@ -997,10 +990,205 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
+  struct FunctionInfo {
+    const Function *F = nullptr;
+    std::string EntryName;
+    std::string ReturnPointerName;
+    std::string ReturnSlotName;
+    SmallVector<std::string, 4> ArgNames;
+  };
+
+  class ModuleFunctionPlan {
+    NameAllocator &Names;
+    SmallVector<const Function *, 8> Functions;
+    DenseMap<const Function *, FunctionInfo> Infos;
+    DenseMap<const Function *, unsigned> VisitState;
+    SmallVector<std::string, 8> Declarations;
+    SmallVector<MapRecord, 8> MapRecords;
+
+    static std::string getOriginalName(const Function &F) {
+      if (F.hasName())
+        return F.getName().str();
+      return "";
+    }
+
+    static bool isSupportedCallType(const FunctionType *Ty) {
+      if (Ty->isVarArg() || !Ty->getReturnType()->isIntegerTy(32))
+        return false;
+      for (Type *ParamTy : Ty->params()) {
+        if (!ParamTy->isIntegerTy(32))
+          return false;
+      }
+      return true;
+    }
+
+    void addMapRecord(const GeneratedName &Name, const Function &F,
+                      StringRef Kind) {
+      MapRecords.push_back({Name.Name,
+                            Kind.str(),
+                            Name.Class,
+                            getOriginalName(F),
+                            Name.Ordinal,
+                            Name.Collision ? std::optional<uint32_t>(
+                                                 Name.CollisionOrdinal)
+                                           : std::nullopt,
+                            Name.Collision,
+                            NameAllocator::getMaxMINameLength(),
+                            Name.Hash,
+                            getSourceLocation(F),
+                            std::nullopt,
+                            std::nullopt,
+                            std::nullopt,
+                            ""});
+    }
+
+    void createMainInfo(const Function &Main) {
+      FunctionInfo Info;
+      Info.F = &Main;
+      Info.EntryName = "MAIN";
+      Info.ReturnPointerName = ".MAIN";
+      Info.ReturnSlotName = "MAIN_RC";
+      Infos[&Main] = std::move(Info);
+      MapRecords.push_back({"MAIN",
+                            "function",
+                            "function",
+                            "main",
+                            std::nullopt,
+                            std::nullopt,
+                            false,
+                            NameAllocator::getMaxMINameLength(),
+                            "",
+                            getSourceLocation(Main),
+                            std::nullopt,
+                            std::nullopt,
+                            std::nullopt,
+                            ""});
+    }
+
+    void createHelperInfo(const Function &F) {
+      GeneratedName Entry = Names.createFunctionName(getOriginalName(F));
+      FunctionInfo Info;
+      Info.F = &F;
+      Info.EntryName = Entry.Name;
+      Info.ReturnPointerName = "." + Entry.Name;
+      Info.ReturnSlotName = Entry.Name + "R";
+      for (unsigned I = 0, E = F.arg_size(); I != E; ++I)
+        Info.ArgNames.push_back(formatv("{0}A{1}", Entry.Name, I + 1).str());
+
+      Declarations.push_back("DCL     INSPTR      " + Info.ReturnPointerName +
+                             ";");
+      Declarations.push_back("DCL     DD          " + Info.ReturnSlotName +
+                             "    BIN(4);");
+      for (StringRef ArgName : Info.ArgNames)
+        Declarations.push_back("DCL     DD          " + ArgName.str() +
+                               "    BIN(4);");
+
+      addMapRecord(Entry, F, "function");
+      Infos[&F] = std::move(Info);
+    }
+
+    void ensureInfo(const Function &F) {
+      if (Infos.contains(&F))
+        return;
+      createHelperInfo(F);
+    }
+
+    void validateFunctionSignature(const Function &F, bool IsMain) const {
+      FunctionType *Ty = F.getFunctionType();
+      if (IsMain) {
+        if (!Ty->getReturnType()->isIntegerTy(32) || Ty->getNumParams() != 0)
+          fail("int main(void)");
+        return;
+      }
+
+      if (!isSupportedCallType(Ty))
+        fail("non-varargs direct calls between functions returning i32 with "
+             "i32 arguments");
+    }
+
+    void visitFunction(const Function &F, bool IsMain) {
+      if (F.isDeclaration())
+        fail("defined functions for direct internal calls");
+      if (F.empty())
+        fail("non-empty defined functions");
+
+      unsigned &State = VisitState[&F];
+      if (State == 1)
+        fail("acyclic direct calls; recursion requires a software stack");
+      if (State == 2)
+        return;
+
+      State = 1;
+      validateFunctionSignature(F, IsMain);
+      ensureInfo(F);
+      Functions.push_back(&F);
+
+      for (const BasicBlock &BB : F) {
+        for (const Instruction &I : BB) {
+          const auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || isa<IntrinsicInst>(I))
+            continue;
+
+          if (CB->isIndirectCall())
+            fail("direct function calls; indirect calls require a function "
+                 "pointer ABI");
+
+          const Function *Callee = CB->getCalledFunction();
+          if (!Callee)
+            fail("direct function calls");
+          if (Callee->isDeclaration())
+            fail("defined internal callees; external calls require CALLX ABI");
+
+          validateFunctionSignature(*Callee, false);
+          visitFunction(*Callee, false);
+        }
+      }
+
+      State = 2;
+    }
+
+  public:
+    explicit ModuleFunctionPlan(NameAllocator &Names) : Names(Names) {}
+
+    void analyze(const Module &M) {
+      const Function *Main = M.getFunction("main");
+      if (!Main || Main->isDeclaration())
+        fail("a defined i32 main function");
+
+      createMainInfo(*Main);
+      visitFunction(*Main, true);
+
+      for (const Function &F : M.functions()) {
+        if (!F.isDeclaration() && !VisitState.contains(&F))
+          fail("defined functions reachable from main");
+      }
+    }
+
+    const Function &getMainFunction() const {
+      if (Functions.empty())
+        fail("a defined i32 main function");
+      return *Functions.front();
+    }
+
+    ArrayRef<const Function *> getFunctions() const { return Functions; }
+
+    const FunctionInfo &getInfo(const Function &F) const {
+      auto It = Infos.find(&F);
+      if (It == Infos.end())
+        fail("function present in module plan");
+      return It->second;
+    }
+
+    ArrayRef<std::string> getDeclarations() const { return Declarations; }
+    ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
+  };
+
   class FunctionLowerer {
-    NameAllocator Names;
+    NameAllocator &Names;
     const DataLayout &DL;
     const ArenaLayout &Layout;
+    const ModuleFunctionPlan &FunctionPlan;
+    const FunctionInfo *CurrentFunction = nullptr;
     DenseMap<const Value *, std::string> Values;
     DenseMap<const Value *, I64Value> I64Values;
     DenseMap<const Value *, ArenaSlot> AggregateValues;
@@ -3020,12 +3208,47 @@ class OS400MIEmitPass : public ModulePass {
       Values[&SI] = Dest;
     }
 
+    void lowerCall(const CallBase &CB) {
+      if (isa<IntrinsicInst>(CB))
+        fail("supported LLVM intrinsics");
+      if (CB.isIndirectCall())
+        fail("direct function calls; indirect calls require a function pointer "
+             "ABI");
+
+      const Function *Callee = CB.getCalledFunction();
+      if (!Callee || Callee->isDeclaration())
+        fail("defined internal callees; external calls require CALLX ABI");
+
+      const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
+      if (!CB.getType()->isIntegerTy(32))
+        fail("direct i32 function call results");
+      if (CB.arg_size() != CalleeInfo.ArgNames.size())
+        fail("direct function call arguments matching callee signature");
+
+      for (unsigned I = 0, E = CB.arg_size(); I != E; ++I) {
+        const Value *Arg = CB.getArgOperand(I);
+        if (!Arg->getType()->isIntegerTy(32))
+          fail("direct i32 function call arguments");
+        Body.push_back("        CPYNV       " + CalleeInfo.ArgNames[I] + "," +
+                       getOperandName(Arg) + ";");
+      }
+
+      Body.push_back("        CALLI       " + CalleeInfo.EntryName +
+                     ", *, " + CalleeInfo.ReturnPointerName + ";");
+      std::string Dest = createTemp(CB);
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     CalleeInfo.ReturnSlotName + ";");
+      Values[&CB] = Dest;
+    }
+
     void lowerReturn(const ReturnInst &RI) {
       Value *Ret = RI.getReturnValue();
       if (!Ret || !isI32(Ret->getType()))
-        fail("i32 returns from main");
-      Body.push_back("        CPYNV       MAIN_RC," + getOperandName(Ret) + ";");
-      Body.push_back("        B           .MAIN;");
+        fail("i32 returns from lowered functions");
+      Body.push_back("        CPYNV       " + CurrentFunction->ReturnSlotName +
+                     "," + getOperandName(Ret) + ";");
+      Body.push_back("        B           " + CurrentFunction->ReturnPointerName +
+                     ";");
     }
 
     void lowerUnconditionalBranch(const UncondBrInst &BI) {
@@ -3071,11 +3294,34 @@ class OS400MIEmitPass : public ModulePass {
     }
 
   public:
-    FunctionLowerer(const DataLayout &DL, const ArenaLayout &Layout)
-        : DL(DL), Layout(Layout),
+    FunctionLowerer(const DataLayout &DL, const ArenaLayout &Layout,
+                    const ModuleFunctionPlan &FunctionPlan,
+                    NameAllocator &Names)
+        : Names(Names), DL(DL), Layout(Layout), FunctionPlan(FunctionPlan),
           NextArenaOffset(Layout.getNextArenaOffset()) {}
 
     void lower(const Function &F) {
+      CurrentFunction = &FunctionPlan.getInfo(F);
+      Values.clear();
+      I64Values.clear();
+      AggregateValues.clear();
+      SignedNarrowValues.clear();
+      Comparisons.clear();
+      I64Comparisons.clear();
+      Slots.clear();
+      BlockLabels.clear();
+      BlockPHIs.clear();
+      EdgeBlocks.clear();
+
+      Body.push_back("ENTRY " + CurrentFunction->EntryName + " INT;");
+
+      unsigned ArgIndex = 0;
+      for (const Argument &Arg : F.args()) {
+        if (!Arg.getType()->isIntegerTy(32))
+          fail("i32 function arguments");
+        Values[&Arg] = CurrentFunction->ArgNames[ArgIndex++];
+      }
+
       for (const BasicBlock &BB : F) {
         std::string Original = getOriginalName(BB);
         GeneratedName Label = Names.createBlockName(Original);
@@ -3132,6 +3378,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerMemCpy(*MI);
           } else if (const auto *MI = dyn_cast<MemSetInst>(&I)) {
             lowerMemSet(*MI);
+          } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            lowerCall(*CB);
           } else if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
             lowerReturn(*RI);
             SawTerminator = true;
@@ -3149,7 +3397,7 @@ class OS400MIEmitPass : public ModulePass {
         }
 
         if (!SawTerminator)
-          fail("each main block ending in ret or branch");
+          fail("each lowered function block ending in ret or branch");
       }
 
       for (const std::string &Line : EdgeBlocks)
@@ -3161,7 +3409,8 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
-  void emitProgram(const ArenaLayout &Layout, const FunctionLowerer &Lowerer) {
+  void emitProgram(const ArenaLayout &Layout, const ModuleFunctionPlan &Plan,
+                   const FunctionLowerer &Lowerer) {
     OS << "DCL     SPCPTR      ARGC@      PARM;\n";
     OS << "DCL     SPCPTR      ARGV@      PARM;\n";
     OS << "DCL     OL          PARM_LIST\n";
@@ -3177,6 +3426,8 @@ class OS400MIEmitPass : public ModulePass {
     OS << "DCL     SPCPTR      .C_BASE    INIT(C_MEM);\n";
     for (const std::string &Decl : Layout.getDeclarations())
       OS << Decl << "\n";
+    for (const std::string &Decl : Plan.getDeclarations())
+      OS << Decl << "\n";
     for (const std::string &Decl : Lowerer.getDeclarations())
       OS << Decl << "\n";
     OS << "DCL     INSPTR      .MAIN;\n";
@@ -3184,7 +3435,6 @@ class OS400MIEmitPass : public ModulePass {
     OS << "        STPLLEN     NBR_PARMS;\n";
     OS << "        CALLI       MAIN, *, .MAIN;\n";
     OS << "        RTX         *;\n";
-    OS << "ENTRY MAIN INT;\n";
     for (const std::string &Line : Lowerer.getBody())
       OS << Line << "\n";
     OS << "        PEND;\n";
@@ -3271,8 +3521,8 @@ class OS400MIEmitPass : public ModulePass {
     MapOS << "}\n";
   }
 
-  void emitMapFile(const ArenaLayout &Layout, const FunctionLowerer &Lowerer,
-                   const Function &Main) {
+  void emitMapFile(const ArenaLayout &Layout, const ModuleFunctionPlan &Plan,
+                   const FunctionLowerer &Lowerer) {
     if (OutputFilename.empty() || OutputFilename == "-")
       return;
 
@@ -3290,9 +3540,8 @@ class OS400MIEmitPass : public ModulePass {
     emitMapRecord(MapOS, makeFixedMapRecord("MAIN_RC", "return_slot",
                                             "reserved", "", {}, std::nullopt,
                                             4, 4));
-    emitMapRecord(MapOS,
-                  makeFixedMapRecord("MAIN", "function", "function", "main",
-                                     getSourceLocation(Main)));
+    for (const MapRecord &Record : Plan.getMapRecords())
+      emitMapRecord(MapOS, Record);
     for (const MapRecord &Record : Layout.getMapRecords())
       emitMapRecord(MapOS, Record);
     for (const MapRecord &Record : Lowerer.getMapRecords())
@@ -3308,13 +3557,29 @@ public:
   StringRef getPassName() const override { return "OS400MI MI Source Emitter"; }
 
   bool runOnModule(Module &M) override {
-    const Function &Main = getMainFunction(M);
-    ArenaLayout Layout(M.getDataLayout());
+    NameAllocator Names;
+    Names.reserveName("ARGC@");
+    Names.reserveName("ARGV@");
+    Names.reserveName("PARM_LIST");
+    Names.reserveName("ARGC");
+    Names.reserveName("ARGV");
+    Names.reserveName("NBR_PARMS");
+    Names.reserveName("MAIN_RC");
+    Names.reserveName("C_MEM");
+    Names.reserveName(".C_BASE");
+    Names.reserveName("MAIN");
+    Names.reserveName(".MAIN");
+
+    ModuleFunctionPlan FunctionPlan(Names);
+    FunctionPlan.analyze(M);
+
+    ArenaLayout Layout(M.getDataLayout(), Names);
     Layout.lower(M);
-    FunctionLowerer Lowerer(M.getDataLayout(), Layout);
-    Lowerer.lower(Main);
-    emitProgram(Layout, Lowerer);
-    emitMapFile(Layout, Lowerer, Main);
+    FunctionLowerer Lowerer(M.getDataLayout(), Layout, FunctionPlan, Names);
+    for (const Function *F : FunctionPlan.getFunctions())
+      Lowerer.lower(*F);
+    emitProgram(Layout, FunctionPlan, Lowerer);
+    emitMapFile(Layout, FunctionPlan, Lowerer);
     return false;
   }
 };

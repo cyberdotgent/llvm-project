@@ -1327,36 +1327,302 @@ class OS400MIEmitPass : public ModulePass {
 
     void emitI64Add(const I64Value &Dest, const I64Value &LHS,
                     const I64Value &RHS) {
-      GeneratedName NoCarryName = Names.createBlockName();
-      std::string NoCarry = NoCarryName.Name;
-      addMapRecord(NoCarryName, "i64_add_no_carry", "", std::nullopt);
+      I64Value Addend = createAnonymousI64Temp("i64_add_addend");
+      I64Value Sum = createAnonymousI64Temp("i64_add_sum");
+      I64Value Carry = createAnonymousI64Temp("i64_add_carry");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName NonZeroName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string NonZero = NonZeroName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "i64_add_loop", "", std::nullopt);
+      addMapRecord(NonZeroName, "i64_add_nonzero", "", std::nullopt);
+      addMapRecord(DoneName, "i64_add_done", "", std::nullopt);
 
-      Body.push_back("        ADDN        " + Dest.Lo + "," + LHS.Lo + "," +
-                     RHS.Lo + ";");
-      Body.push_back("        ADDN        " + Dest.Hi + "," + LHS.Hi + "," +
-                     RHS.Hi + ";");
-      Body.push_back("        CMPNV(B)    " + Dest.Lo + "," + LHS.Lo +
-                     "/NLO(" + NoCarry + ");");
-      Body.push_back("        ADDN        " + Dest.Hi + "," + Dest.Hi +
-                     ",1;");
-      Body.push_back(NoCarry + ":");
+      emitI64Copy(Dest, LHS);
+      emitI64Copy(Addend, RHS);
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Addend.Hi + ",0/NEQ(" +
+                     NonZero + ");");
+      Body.push_back("        CMPNV(B)    " + Addend.Lo + ",0/EQ(" + Done +
+                     ");");
+      Body.push_back(NonZero + ":");
+      emitI64Bitwise(Sum, Dest, Addend, Instruction::Xor);
+      emitI64Bitwise(Carry, Dest, Addend, Instruction::And);
+      emitI64ShiftLeftOne(Carry);
+      emitI64Copy(Dest, Sum);
+      emitI64Copy(Addend, Carry);
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
     }
 
     void emitI64Sub(const I64Value &Dest, const I64Value &LHS,
                     const I64Value &RHS) {
-      GeneratedName NoBorrowName = Names.createBlockName();
-      std::string NoBorrow = NoBorrowName.Name;
-      addMapRecord(NoBorrowName, "i64_sub_no_borrow", "", std::nullopt);
+      I64Value Ones = createAnonymousI64Temp("i64_ones");
+      I64Value One = createAnonymousI64Temp("i64_one");
+      I64Value NotRHS = createAnonymousI64Temp("i64_not_rhs");
+      I64Value NegRHS = createAnonymousI64Temp("i64_neg_rhs");
+      Body.push_back("        CPYBLA      " + Ones.Bytes +
+                     ",X'FFFFFFFFFFFFFFFF';");
+      Body.push_back("        CPYBLA      " + One.Bytes +
+                     ",X'0000000000000001';");
+      emitI64Bitwise(NotRHS, RHS, Ones, Instruction::Xor);
+      emitI64Add(NegRHS, NotRHS, One);
+      emitI64Add(Dest, LHS, NegRHS);
+    }
 
-      Body.push_back("        SUBN        " + Dest.Lo + "," + LHS.Lo + "," +
-                     RHS.Lo + ";");
-      Body.push_back("        SUBN        " + Dest.Hi + "," + LHS.Hi + "," +
-                     RHS.Hi + ";");
-      Body.push_back("        CMPNV(B)    " + LHS.Lo + "," + RHS.Lo +
-                     "/NLO(" + NoBorrow + ");");
-      Body.push_back("        SUBN        " + Dest.Hi + "," + Dest.Hi +
+    void emitI64Copy(const I64Value &Dest, const I64Value &Source) {
+      Body.push_back("        CPYBLA      " + Dest.Bytes + "," + Source.Bytes +
+                     ";");
+    }
+
+    void emitI64Zero(const I64Value &Dest) {
+      Body.push_back("        CPYBLA      " + Dest.Bytes +
+                     ",X'0000000000000000';");
+    }
+
+    void emitI64Negate(const I64Value &Dest, const I64Value &Source) {
+      I64Value Zero = createAnonymousI64Temp("i64_zero");
+      emitI64Zero(Zero);
+      emitI64Sub(Dest, Zero, Source);
+    }
+
+    void emitI64ShiftLeftOne(const I64Value &Value) {
+      I64Value Scratch = createAnonymousI64Temp("i64_shift_scratch");
+      Body.push_back("        CPYBTLLS    " + Scratch.Bytes + "," +
+                     Value.Bytes + ",1;");
+      emitI64Copy(Value, Scratch);
+    }
+
+    void emitI64LogicalShiftRightOne(const I64Value &Value) {
+      I64Value Scratch = createAnonymousI64Temp("i64_shift_scratch");
+      Body.push_back("        CPYBTRLS    " + Scratch.Bytes + "," +
+                     Value.Bytes + ",1;");
+      emitI64Copy(Value, Scratch);
+    }
+
+    void emitI64ArithmeticShiftRightOne(const I64Value &Value) {
+      I64Value Scratch = createAnonymousI64Temp("i64_shift_scratch");
+      Body.push_back("        CPYBTRAS    " + Scratch.Bytes + "," +
+                     Value.Bytes + ",1;");
+      emitI64Copy(Value, Scratch);
+    }
+
+    void emitI64VariableShift(const I64Value &Dest, const I64Value &LHS,
+                              const I64Value &RHS, Instruction::BinaryOps Op) {
+      std::string Count = createAnonymousTemp("i64_shift_count");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "i64_shift_loop", "", std::nullopt);
+      addMapRecord(DoneName, "i64_shift_done", "", std::nullopt);
+
+      emitI64Copy(Dest, LHS);
+      Body.push_back("        CPYNV       " + Count + "," + RHS.Lo + ";");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      if (Op == Instruction::Shl)
+        emitI64ShiftLeftOne(Dest);
+      else if (Op == Instruction::LShr)
+        emitI64LogicalShiftRightOne(Dest);
+      else if (Op == Instruction::AShr)
+        emitI64ArithmeticShiftRightOne(Dest);
+      else
+        fail("i64 shift operation");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    void emitI64Bitwise(const I64Value &Dest, const I64Value &LHS,
+                        const I64Value &RHS, Instruction::BinaryOps Op) {
+      StringRef Opcode;
+      switch (Op) {
+      case Instruction::And:
+        Opcode = "AND";
+        break;
+      case Instruction::Or:
+        Opcode = "OR";
+        break;
+      case Instruction::Xor:
+        Opcode = "XOR";
+        break;
+      default:
+        fail("i64 bitwise operation");
+      }
+      Body.push_back("        " + Opcode.str() +
+                     std::string(11 - Opcode.size(), ' ') + Dest.Bytes + "," +
+                     LHS.Bytes + "," + RHS.Bytes + ";");
+    }
+
+    std::string emitI64LowBitValue(const I64Value &Source) {
+      std::string Bit = createAnonymousTemp("i64_low_bit");
+      Body.push_back("        CPYBLA      " + Bit + "B,X'00000001';");
+      Body.push_back("        AND         " + Bit + "B," + Source.LoBytes +
+                     "," + Bit + "B;");
+      return Bit;
+    }
+
+    void emitI64UnsignedMul(const I64Value &Dest, const I64Value &LHS,
+                            const I64Value &RHS) {
+      I64Value Multiplicand = createAnonymousI64Temp("i64_mul_multiplicand");
+      I64Value Multiplier = createAnonymousI64Temp("i64_mul_multiplier");
+      std::string Count = createAnonymousTemp("i64_mul_count");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName SkipAddName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string SkipAdd = SkipAddName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "i64_mul_loop", "", std::nullopt);
+      addMapRecord(SkipAddName, "i64_mul_skip_add", "", std::nullopt);
+      addMapRecord(DoneName, "i64_mul_done", "", std::nullopt);
+
+      emitI64Zero(Dest);
+      emitI64Copy(Multiplicand, LHS);
+      emitI64Copy(Multiplier, RHS);
+      Body.push_back("        CPYNV       " + Count + ",64;");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      std::string LowBit = emitI64LowBitValue(Multiplier);
+      Body.push_back("        CMPNV(B)    " + LowBit + ",0/EQ(" + SkipAdd +
+                     ");");
+      emitI64Add(Dest, Dest, Multiplicand);
+      Body.push_back(SkipAdd + ":");
+      emitI64ShiftLeftOne(Multiplicand);
+      emitI64LogicalShiftRightOne(Multiplier);
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    void emitI64UnsignedDivRem(const I64Value &Quotient,
+                               const I64Value &Remainder,
+                               const I64Value &Dividend,
+                               const I64Value &Divisor) {
+      I64Value WorkDividend = createAnonymousI64Temp("i64_div_dividend");
+      std::string Count = createAnonymousTemp("i64_div_count");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName NoTopBitName = Names.createBlockName();
+      GeneratedName ReduceName = Names.createBlockName();
+      GeneratedName AfterCmpName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string NoTopBit = NoTopBitName.Name;
+      std::string Reduce = ReduceName.Name;
+      std::string AfterCmp = AfterCmpName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "i64_div_loop", "", std::nullopt);
+      addMapRecord(NoTopBitName, "i64_div_no_top_bit", "", std::nullopt);
+      addMapRecord(ReduceName, "i64_div_reduce", "", std::nullopt);
+      addMapRecord(AfterCmpName, "i64_div_after_cmp", "", std::nullopt);
+      addMapRecord(DoneName, "i64_div_done", "", std::nullopt);
+
+      emitI64Zero(Quotient);
+      emitI64Zero(Remainder);
+      emitI64Copy(WorkDividend, Dividend);
+      Body.push_back("        CPYNV       " + Count + ",64;");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      emitI64ShiftLeftOne(Quotient);
+      emitI64ShiftLeftOne(Remainder);
+      Body.push_back("        CMPNV(B)    " + WorkDividend.Hi + ",0/NLO(" +
+                     NoTopBit + ");");
+      Body.push_back("        ADDN        " + Remainder.Lo + "," +
+                     Remainder.Lo + ",1;");
+      Body.push_back(NoTopBit + ":");
+      emitI64ShiftLeftOne(WorkDividend);
+      emitI64CompareTrueBranch({CmpInst::ICMP_UGE, Remainder, Divisor}, Reduce,
+                               AfterCmp);
+      Body.push_back("        B           " + AfterCmp + ";");
+      Body.push_back(Reduce + ":");
+      emitI64Sub(Remainder, Remainder, Divisor);
+      Body.push_back("        ADDN        " + Quotient.Lo + "," + Quotient.Lo +
                      ",1;");
-      Body.push_back(NoBorrow + ":");
+      Body.push_back(AfterCmp + ":");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    void emitI64Abs(const I64Value &Dest, const I64Value &Source,
+                    StringRef NegativeFlag) {
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Done = DoneName.Name;
+      addMapRecord(DoneName, "i64_abs_done", "", std::nullopt);
+
+      emitI64Copy(Dest, Source);
+      Body.push_back("        CPYNV       " + NegativeFlag.str() + ",0;");
+      Body.push_back("        CMPNV(B)    " + Source.Hi + ",0/NLO(" + Done +
+                     ");");
+      Body.push_back("        CPYNV       " + NegativeFlag.str() + ",1;");
+      emitI64Negate(Dest, Source);
+      Body.push_back(Done + ":");
+    }
+
+    std::string emitXorFlags(StringRef LHS, StringRef RHS) {
+      std::string Result = createAnonymousTemp("i64_sign_xor");
+      GeneratedName RhsZeroName = Names.createBlockName();
+      GeneratedName LhsZeroName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string RhsZero = RhsZeroName.Name;
+      std::string LhsZero = LhsZeroName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(RhsZeroName, "i64_sign_rhs_zero", "", std::nullopt);
+      addMapRecord(LhsZeroName, "i64_sign_lhs_zero", "", std::nullopt);
+      addMapRecord(DoneName, "i64_sign_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       " + Result + "," + LHS.str() + ";");
+      Body.push_back("        CMPNV(B)    " + RHS.str() + ",0/EQ(" + RhsZero +
+                     ");");
+      Body.push_back("        CMPNV(B)    " + LHS.str() + ",0/EQ(" + LhsZero +
+                     ");");
+      Body.push_back("        CPYNV       " + Result + ",0;");
+      Body.push_back("        B           " + Done + ";");
+      Body.push_back(LhsZero + ":");
+      Body.push_back("        CPYNV       " + Result + ",1;");
+      Body.push_back("        B           " + Done + ";");
+      Body.push_back(RhsZero + ":");
+      Body.push_back(Done + ":");
+      return Result;
+    }
+
+    void emitI64ConditionalNegate(const I64Value &Value, StringRef Flag) {
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Done = DoneName.Name;
+      addMapRecord(DoneName, "i64_cond_neg_done", "", std::nullopt);
+      Body.push_back("        CMPNV(B)    " + Flag.str() + ",0/EQ(" + Done +
+                     ");");
+      I64Value Negated = createAnonymousI64Temp("i64_negated");
+      emitI64Negate(Negated, Value);
+      emitI64Copy(Value, Negated);
+      Body.push_back(Done + ":");
+    }
+
+    void emitI64SignedDivRem(const I64Value &Dest, const I64Value &LHS,
+                             const I64Value &RHS, bool WantRemainder) {
+      I64Value AbsLHS = createAnonymousI64Temp("i64_abs_lhs");
+      I64Value AbsRHS = createAnonymousI64Temp("i64_abs_rhs");
+      I64Value Quotient = createAnonymousI64Temp("i64_signed_quotient");
+      I64Value Remainder = createAnonymousI64Temp("i64_signed_remainder");
+      std::string LHSNegative = createAnonymousTemp("i64_lhs_negative");
+      std::string RHSNegative = createAnonymousTemp("i64_rhs_negative");
+
+      emitI64Abs(AbsLHS, LHS, LHSNegative);
+      emitI64Abs(AbsRHS, RHS, RHSNegative);
+      emitI64UnsignedDivRem(Quotient, Remainder, AbsLHS, AbsRHS);
+
+      if (WantRemainder) {
+        emitI64ConditionalNegate(Remainder, LHSNegative);
+        emitI64Copy(Dest, Remainder);
+        return;
+      }
+
+      std::string QuotientNegative = emitXorFlags(LHSNegative, RHSNegative);
+      emitI64ConditionalNegate(Quotient, QuotientNegative);
+      emitI64Copy(Dest, Quotient);
     }
 
     void lowerI64BinaryOperator(const BinaryOperator &BO) {
@@ -1370,23 +1636,63 @@ class OS400MIEmitPass : public ModulePass {
       case Instruction::Sub:
         emitI64Sub(Dest, LHS, getI64Operand(BO.getOperand(1)));
         break;
+      case Instruction::Mul:
+        emitI64UnsignedMul(Dest, LHS, getI64Operand(BO.getOperand(1)));
+        break;
+      case Instruction::UDiv: {
+        I64Value Remainder = createAnonymousI64Temp("i64_udiv_remainder");
+        emitI64UnsignedDivRem(Dest, Remainder, LHS,
+                              getI64Operand(BO.getOperand(1)));
+        break;
+      }
+      case Instruction::URem: {
+        I64Value Quotient = createAnonymousI64Temp("i64_urem_quotient");
+        emitI64UnsignedDivRem(Quotient, Dest, LHS,
+                              getI64Operand(BO.getOperand(1)));
+        break;
+      }
+      case Instruction::SDiv:
+        emitI64SignedDivRem(Dest, LHS, getI64Operand(BO.getOperand(1)),
+                            false);
+        break;
+      case Instruction::SRem:
+        emitI64SignedDivRem(Dest, LHS, getI64Operand(BO.getOperand(1)), true);
+        break;
+      case Instruction::And:
+      case Instruction::Or:
+      case Instruction::Xor:
+        emitI64Bitwise(Dest, LHS, getI64Operand(BO.getOperand(1)),
+                       BO.getOpcode());
+        break;
       case Instruction::Shl:
-        Body.push_back("        CPYBTLLS    " + Dest.Bytes + "," + LHS.Bytes +
-                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
-                       ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTLLS    " + Dest.Bytes + "," +
+                         LHS.Bytes + "," +
+                         getConstantShiftAmount(BO.getOperand(1), 64) + ";");
+        else
+          emitI64VariableShift(Dest, LHS, getI64Operand(BO.getOperand(1)),
+                               BO.getOpcode());
         break;
       case Instruction::LShr:
-        Body.push_back("        CPYBTRLS    " + Dest.Bytes + "," + LHS.Bytes +
-                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
-                       ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTRLS    " + Dest.Bytes + "," +
+                         LHS.Bytes + "," +
+                         getConstantShiftAmount(BO.getOperand(1), 64) + ";");
+        else
+          emitI64VariableShift(Dest, LHS, getI64Operand(BO.getOperand(1)),
+                               BO.getOpcode());
         break;
       case Instruction::AShr:
-        Body.push_back("        CPYBTRAS    " + Dest.Bytes + "," + LHS.Bytes +
-                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
-                       ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTRAS    " + Dest.Bytes + "," +
+                         LHS.Bytes + "," +
+                         getConstantShiftAmount(BO.getOperand(1), 64) + ";");
+        else
+          emitI64VariableShift(Dest, LHS, getI64Operand(BO.getOperand(1)),
+                               BO.getOpcode());
         break;
       default:
-        fail("i64 add/sub and constant shift expressions");
+        fail("i64 arithmetic, bitwise, and shift expressions");
       }
 
       I64Values[&BO] = Dest;

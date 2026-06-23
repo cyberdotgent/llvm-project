@@ -29,12 +29,13 @@ entry:
 ; CHECK: DCL     DD          [[I64]]L    BIN(4)     UNSGND DEF([[I64]]) POS(5);
 ; CHECK: DCL     DD          [[I64]]LB   CHAR(4)    DEF([[I64]]) POS(5);
 ; CHECK: CPYBLA      {{T[0-9]+}},X'0000000000000005';
-; CHECK: ADDN        {{T[0-9]+}}L,{{T[0-9]+}}L,{{T[0-9]+}}L;
-; CHECK: CMPNV(B)    {{T[0-9]+}}L,{{T[0-9]+}}L/NLO({{B[0-9]+}});
-; CHECK: SUBN        {{T[0-9]+}}L,{{T[0-9]+}}L,{{T[0-9]+}}L;
-; CHECK: CMPNV(B)    {{T[0-9]+}}L,{{T[0-9]+}}L/NLO({{B[0-9]+}});
+; CHECK: XOR        {{T[0-9]+}},{{T[0-9]+}},{{T[0-9]+}};
+; CHECK: AND        {{T[0-9]+}},{{T[0-9]+}},{{T[0-9]+}};
+; CHECK: CPYBTLLS    {{T[0-9]+}},{{T[0-9]+}},1;
+; CHECK: CPYBLA      {{T[0-9]+}},X'FFFFFFFFFFFFFFFF';
+; CHECK: XOR        {{T[0-9]+}},{{T[0-9]+}},{{T[0-9]+}};
+; CHECK: AND        {{T[0-9]+}},{{T[0-9]+}},{{T[0-9]+}};
 ; CHECK: CPYBTLLS    {{T[0-9]+}},{{T[0-9]+}},3;
 ; CHECK: CMPNV(B)    {{T[0-9]+}}U,{{T[0-9]+}}U/LO({{B[0-9]+}});
 ; CHECK: CMPNV(B)    {{T[0-9]+}}L,{{T[0-9]+}}L/LO({{B[0-9]+}});
 ; CHECK: CPYBLA      {{T[0-9]+}}B,{{T[0-9]+}}LB;
-

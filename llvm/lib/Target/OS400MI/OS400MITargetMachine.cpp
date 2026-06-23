@@ -394,6 +394,10 @@ class OS400MIEmitPass : public ModulePass {
     bool DirectScalar = false;
   };
 
+  static bool isSupportedArenaValueType(Type *Ty) {
+    return isSupportedArenaAggregateType(Ty);
+  }
+
   struct CompareValue {
     CmpInst::Predicate Predicate;
     std::string LHS;
@@ -787,9 +791,8 @@ class OS400MIEmitPass : public ModulePass {
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
-      Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
-                             std::to_string(Size) +
-                             ")    DEF(C_MEM) POS(" +
+      Declarations.push_back("DCL DD " + Name.Name + " CHAR(" +
+                             std::to_string(Size) + ") DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(X'" +
                              getRawHex(Bytes) + "');");
       addGlobalObject(GV, Name, "aggregate", Offset, Size, Alignment,
@@ -863,6 +866,7 @@ class OS400MIEmitPass : public ModulePass {
     const DataLayout &DL;
     const ArenaLayout &Layout;
     DenseMap<const Value *, std::string> Values;
+    DenseMap<const Value *, ArenaSlot> AggregateValues;
     DenseMap<const Value *, std::string> SignedNarrowValues;
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
@@ -1088,6 +1092,8 @@ class OS400MIEmitPass : public ModulePass {
       GeneratedName Name = Names.createTempName(Original);
       Declarations.push_back("DCL     DD          " + Name.Name +
                              "    BIN(4);");
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             "B   CHAR(4)    DEF(" + Name.Name + ") POS(1);");
       addMapRecord(Name, "temp", std::move(Original),
                    isa<Instruction>(&V)
                        ? getSourceLocation(cast<Instruction>(V))
@@ -1100,8 +1106,90 @@ class OS400MIEmitPass : public ModulePass {
       GeneratedName Name = Names.createTempName();
       Declarations.push_back("DCL     DD          " + Name.Name +
                              "    BIN(4);");
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             "B   CHAR(4)    DEF(" + Name.Name + ") POS(1);");
       addMapRecord(Name, Kind.str(), "", std::nullopt, std::nullopt, 4, 4);
       return Name.Name;
+    }
+
+    ArenaSlot createAggregateTemp(const Value &V, Type *Ty, StringRef Kind) {
+      if (!isSupportedArenaValueType(Ty))
+        fail("integer array/struct aggregate values");
+
+      uint32_t Size = static_cast<uint32_t>(DL.getTypeAllocSize(Ty));
+      uint32_t Alignment = getABIAlignment(DL, Ty);
+      uint32_t Offset = alignTo(NextArenaOffset, Alignment);
+      if (Offset + Size > ArenaSize)
+        fail("phase-1 arena storage within 256 bytes");
+
+      std::string Original = getOriginalName(V);
+      GeneratedName SlotName = Names.createSlotName(Original);
+      ArenaSlot Slot{SlotName.Name, Offset, Size, AccessWidth::I8, false};
+      NextArenaOffset = Offset + Size;
+      Declarations.push_back("DCL     DD          " + Slot.Name +
+                             "    CHAR(" + std::to_string(Size) +
+                             ")    DEF(C_MEM) POS(" +
+                             std::to_string(Slot.Offset + 1) + ");");
+      addMapRecord(SlotName, Kind.str(), std::move(Original),
+                   isa<Instruction>(&V)
+                       ? getSourceLocation(cast<Instruction>(V))
+                       : std::nullopt,
+                   Slot.Offset, Size, Alignment);
+      return Slot;
+    }
+
+    uint64_t getIndexedOffset(Type *BaseTy, ArrayRef<unsigned> Indices) const {
+      Type *Ty = BaseTy;
+      uint64_t Offset = 0;
+      for (unsigned Index : Indices) {
+        if (auto *ST = dyn_cast<StructType>(Ty)) {
+          if (Index >= ST->getNumElements())
+            fail("extractvalue/insertvalue struct indices in range");
+          Offset += DL.getStructLayout(ST)->getElementOffset(Index);
+          Ty = ST->getElementType(Index);
+          continue;
+        }
+
+        if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+          if (Index >= AT->getNumElements())
+            fail("extractvalue/insertvalue array indices in range");
+          Ty = AT->getElementType();
+          Offset += Index * DL.getTypeAllocSize(Ty);
+          continue;
+        }
+
+        fail("extractvalue/insertvalue through integer arrays/structs");
+      }
+      return Offset;
+    }
+
+    std::string getI32ByteOperandName(const Value *V) {
+      if (!isI32(V->getType()))
+        fail("i32 bitwise operands");
+
+      if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+        std::string Temp = createAnonymousTemp("bitwise_const");
+        Body.push_back("        CPYNV       " + Temp + "," +
+                       std::to_string(static_cast<int32_t>(
+                           CI->getSExtValue())) +
+                       ";");
+        return Temp + "B";
+      }
+
+      auto It = Values.find(V);
+      if (It == Values.end())
+        fail("operands defined by previous supported i32 instructions");
+      return It->second + "B";
+    }
+
+    static std::string getConstantShiftAmount(const Value *V) {
+      const auto *CI = dyn_cast<ConstantInt>(V);
+      if (!CI)
+        fail("constant i32 shift amounts");
+      uint64_t Amount = CI->getZExtValue();
+      if (Amount > 31)
+        fail("i32 shift amounts in range 0..31");
+      return std::to_string(Amount);
     }
 
     void lowerAlloca(const AllocaInst &AI) {
@@ -1153,7 +1241,7 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
       if (!isI32(BO.getType()))
-        fail("i32 add/sub expressions");
+        fail("i32 arithmetic, bitwise, and constant shift expressions");
 
       std::string Dest = createTemp(BO);
       std::string LHS = getOperandName(BO.getOperand(0));
@@ -1168,8 +1256,49 @@ class OS400MIEmitPass : public ModulePass {
         Body.push_back("        SUBN        " + Dest + "," + LHS + "," + RHS +
                        ";");
         break;
+      case Instruction::Mul:
+        Body.push_back("        MULT        " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::SDiv:
+      case Instruction::UDiv:
+        Body.push_back("        DIV         " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::SRem:
+      case Instruction::URem:
+        Body.push_back("        REM         " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::And:
+        Body.push_back("        AND         " + Dest + "B," +
+                       getI32ByteOperandName(BO.getOperand(0)) + "," +
+                       getI32ByteOperandName(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Or:
+        Body.push_back("        OR          " + Dest + "B," +
+                       getI32ByteOperandName(BO.getOperand(0)) + "," +
+                       getI32ByteOperandName(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Xor:
+        Body.push_back("        XOR         " + Dest + "B," +
+                       getI32ByteOperandName(BO.getOperand(0)) + "," +
+                       getI32ByteOperandName(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Shl:
+        Body.push_back("        CPYBTLLS    " + Dest + "," + LHS + "," +
+                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::LShr:
+        Body.push_back("        CPYBTRLS    " + Dest + "," + LHS + "," +
+                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::AShr:
+        Body.push_back("        CPYBTRAS    " + Dest + "," + LHS + "," +
+                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        break;
       default:
-        fail("i32 add/sub expressions");
+        fail("i32 arithmetic, bitwise, and constant shift expressions");
       }
 
       Values[&BO] = Dest;
@@ -1498,10 +1627,8 @@ class OS400MIEmitPass : public ModulePass {
         emitStoreByteToPointer(Base, I, Bytes[I]);
     }
 
-    void emitCopyBytes(const Value *DestPtr, const Value *SourcePtr,
-                       uint64_t Size) {
-      std::string DestBase = getPointerOffsetName(DestPtr);
-      std::string SourceBase = getPointerOffsetName(SourcePtr);
+    void emitCopyBytesByOffset(StringRef DestBase, StringRef SourceBase,
+                               uint64_t Size) {
       ensureU1Box();
       for (uint64_t I = 0; I != Size; ++I) {
         emitSetLensPointerFromOffset(getPointerOffsetPlus(SourceBase, I));
@@ -1511,8 +1638,14 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
 
-    void emitFillBytes(const Value *DestPtr, uint64_t Size, const Value *Byte) {
-      std::string DestBase = getPointerOffsetName(DestPtr);
+    void emitCopyBytes(const Value *DestPtr, const Value *SourcePtr,
+                       uint64_t Size) {
+      emitCopyBytesByOffset(getPointerOffsetName(DestPtr),
+                            getPointerOffsetName(SourcePtr), Size);
+    }
+
+    void emitFillBytesByOffset(StringRef DestBase, uint64_t Size,
+                               const Value *Byte) {
       std::optional<std::string> ConstantHex;
       if (const auto *CI = dyn_cast<ConstantInt>(Byte))
         ConstantHex = getByteHex(*CI);
@@ -1529,6 +1662,10 @@ class OS400MIEmitPass : public ModulePass {
         else
           Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
       }
+    }
+
+    void emitFillBytes(const Value *DestPtr, uint64_t Size, const Value *Byte) {
+      emitFillBytesByOffset(getPointerOffsetName(DestPtr), Size, Byte);
     }
 
     static uint64_t getConstantLength(const Value *V) {
@@ -1551,10 +1688,18 @@ class OS400MIEmitPass : public ModulePass {
     void lowerStore(const StoreInst &SI) {
       Type *ValueTy = SI.getValueOperand()->getType();
       if (!isSupportedInt(ValueTy)) {
+        auto AggIt = AggregateValues.find(SI.getValueOperand());
+        if (AggIt != AggregateValues.end()) {
+          emitCopyBytesByOffset(getPointerOffsetName(SI.getPointerOperand()),
+                                std::to_string(AggIt->second.Offset),
+                                AggIt->second.Size);
+          return;
+        }
+
         std::optional<SmallVector<uint8_t, 32>> Bytes =
             getConstantStoreBytes(SI.getValueOperand());
         if (!Bytes)
-          fail("constant integer aggregate stores");
+          fail("integer aggregate values from constants or aggregate loads");
         emitStoreBytesToPointer(SI.getPointerOperand(), *Bytes);
         return;
       }
@@ -1573,6 +1718,15 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerLoad(const LoadInst &LI) {
+      if (!isSupportedInt(LI.getType())) {
+        ArenaSlot Slot = createAggregateTemp(LI, LI.getType(), "aggregate_temp");
+        emitCopyBytesByOffset(std::to_string(Slot.Offset),
+                              getPointerOffsetName(LI.getPointerOperand()),
+                              Slot.Size);
+        AggregateValues[&LI] = Slot;
+        return;
+      }
+
       AccessWidth Width = getAccessWidth(LI.getType());
 
       std::string Dest = createTemp(LI);
@@ -1588,6 +1742,80 @@ class OS400MIEmitPass : public ModulePass {
       emitSetLensPointer(LI.getPointerOperand());
       emitLoadFromReference(Dest, getLensName(Width), Width);
       Values[&LI] = Dest;
+    }
+
+    void lowerExtractValue(const ExtractValueInst &EVI) {
+      auto AggIt = AggregateValues.find(EVI.getAggregateOperand());
+      if (AggIt == AggregateValues.end())
+        fail("extractvalue from supported aggregate values");
+
+      Type *ResultTy = EVI.getType();
+      uint64_t Offset =
+          AggIt->second.Offset +
+          getIndexedOffset(EVI.getAggregateOperand()->getType(),
+                           EVI.getIndices());
+
+      if (isSupportedInt(ResultTy)) {
+        AccessWidth Width = getAccessWidth(ResultTy);
+        std::string Dest = createTemp(EVI);
+        emitSetLensPointerFromOffset(std::to_string(Offset));
+        emitLoadFromReference(Dest, getLensName(Width), Width);
+        Values[&EVI] = Dest;
+        return;
+      }
+
+      if (!isSupportedArenaValueType(ResultTy))
+        fail("extractvalue scalar or integer aggregate results");
+
+      ArenaSlot Slot = createAggregateTemp(EVI, ResultTy, "aggregate_temp");
+      emitCopyBytesByOffset(std::to_string(Slot.Offset), std::to_string(Offset),
+                            Slot.Size);
+      AggregateValues[&EVI] = Slot;
+    }
+
+    void lowerInsertValue(const InsertValueInst &IVI) {
+      Type *AggTy = IVI.getType();
+      if (!isSupportedArenaValueType(AggTy))
+        fail("insertvalue into integer array/struct aggregate values");
+
+      ArenaSlot Slot = createAggregateTemp(IVI, AggTy, "aggregate_temp");
+      const Value *Base = IVI.getAggregateOperand();
+      if (auto AggIt = AggregateValues.find(Base);
+          AggIt != AggregateValues.end()) {
+        emitCopyBytesByOffset(std::to_string(Slot.Offset),
+                              std::to_string(AggIt->second.Offset),
+                              Slot.Size);
+      } else if (auto *C = dyn_cast<Constant>(Base)) {
+        if (isa<UndefValue>(C))
+          emitFillBytesByOffset(std::to_string(Slot.Offset), Slot.Size,
+                                ConstantInt::get(Type::getInt8Ty(IVI.getContext()),
+                                                 0));
+        else if (std::optional<SmallVector<uint8_t, 32>> Bytes =
+                     getConstantStoreBytes(C))
+          for (uint64_t I = 0, E = Bytes->size(); I != E; ++I)
+            emitStoreByteToPointer(std::to_string(Slot.Offset), I, (*Bytes)[I]);
+        else
+          fail("insertvalue base aggregate constants");
+      } else {
+        fail("insertvalue base aggregate values");
+      }
+
+      uint64_t Offset = Slot.Offset + getIndexedOffset(AggTy, IVI.getIndices());
+      const Value *Inserted = IVI.getInsertedValueOperand();
+      if (isSupportedInt(Inserted->getType())) {
+        AccessWidth Width = getAccessWidth(Inserted->getType());
+        emitSetLensPointerFromOffset(std::to_string(Offset));
+        emitStoreToReference(getLensName(Width), Width, Inserted);
+      } else {
+        auto InsertedAggIt = AggregateValues.find(Inserted);
+        if (InsertedAggIt == AggregateValues.end())
+          fail("insertvalue inserted scalar or aggregate values");
+        emitCopyBytesByOffset(std::to_string(Offset),
+                              std::to_string(InsertedAggIt->second.Offset),
+                              InsertedAggIt->second.Size);
+      }
+
+      AggregateValues[&IVI] = Slot;
     }
 
     void lowerZExt(const ZExtInst &ZI) {
@@ -1747,6 +1975,10 @@ class OS400MIEmitPass : public ModulePass {
             lowerStore(*SI);
           } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
             lowerLoad(*LI);
+          } else if (const auto *EVI = dyn_cast<ExtractValueInst>(&I)) {
+            lowerExtractValue(*EVI);
+          } else if (const auto *IVI = dyn_cast<InsertValueInst>(&I)) {
+            lowerInsertValue(*IVI);
           } else if (const auto *MI = dyn_cast<MemCpyInst>(&I)) {
             lowerMemCpy(*MI);
           } else if (const auto *MI = dyn_cast<MemSetInst>(&I)) {
@@ -1762,7 +1994,8 @@ class OS400MIEmitPass : public ModulePass {
             SawTerminator = true;
           } else {
             fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/sext/select/"
-                 "phi, memcpy, memset, branch, and ret instructions");
+                 "phi, extractvalue, insertvalue, memcpy, memset, branch, and "
+                 "ret instructions");
           }
         }
 

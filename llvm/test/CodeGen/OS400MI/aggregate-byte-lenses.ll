@@ -25,7 +25,7 @@ entry:
   ret i32 %sum
 }
 
-; CHECK: DCL     DD          G000001    CHAR(4)    DEF(C_MEM) POS(5) INIT(X'0A141E28');
+; CHECK: DCL DD G000001 CHAR(4) DEF(C_MEM) POS(5) INIT(X'0A141E28');
 ; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_MEM)
 ; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_MEM)
 ; CHECK: CPYBLA      U1_BYTE,LS_I1;

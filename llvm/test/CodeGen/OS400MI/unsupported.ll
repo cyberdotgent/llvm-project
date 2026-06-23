@@ -4,9 +4,12 @@ target datalayout = "E-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:32-f3
 target triple = "os400mi-ibm-os400"
 
 define i32 @main() {
-  %x = add i64 6, 7
+  %a = alloca i64, align 4
+  store i64 6, ptr %a, align 4
+  %v = load i64, ptr %a, align 4
+  %x = mul i64 %v, 7
   %y = trunc i64 %x to i32
   ret i32 %y
 }
 
-; CHECK: OS400MI MVP only supports i32 arithmetic, bitwise, and constant shift expressions
+; CHECK: OS400MI MVP only supports i64 add/sub and constant shift expressions

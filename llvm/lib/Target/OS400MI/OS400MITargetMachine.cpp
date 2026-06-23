@@ -48,6 +48,7 @@
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/TargetParser/Triple.h"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -278,7 +279,7 @@ class OS400MIEmitPass : public ModulePass {
     }
   };
 
-  enum class AccessWidth : uint8_t { I8 = 1, I16 = 2, I32 = 4 };
+  enum class AccessWidth : uint8_t { I8 = 1, I16 = 2, I32 = 4, I64 = 8 };
 
   static AccessWidth getIntegerAccessWidth(Type *Ty) {
     if (Ty->isIntegerTy(8))
@@ -287,7 +288,9 @@ class OS400MIEmitPass : public ModulePass {
       return AccessWidth::I16;
     if (Ty->isIntegerTy(32))
       return AccessWidth::I32;
-    fail("i8/i16/i32 arena accesses");
+    if (Ty->isIntegerTy(64))
+      return AccessWidth::I64;
+    fail("i8/i16/i32/i64 arena accesses");
     llvm_unreachable("fail should not return");
   }
 
@@ -308,7 +311,8 @@ class OS400MIEmitPass : public ModulePass {
   }
 
   static bool isSupportedArenaAggregateType(Type *Ty) {
-    if (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) || Ty->isIntegerTy(32))
+    if (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
+        Ty->isIntegerTy(32) || Ty->isIntegerTy(64))
       return true;
 
     if (const auto *AT = dyn_cast<ArrayType>(Ty))
@@ -345,8 +349,8 @@ class OS400MIEmitPass : public ModulePass {
 
     if (const auto *CI = dyn_cast<ConstantInt>(C)) {
       if (!(CI->getType()->isIntegerTy(8) || CI->getType()->isIntegerTy(16) ||
-            CI->getType()->isIntegerTy(32)))
-        fail("i8/i16/i32 integer aggregate constants");
+            CI->getType()->isIntegerTy(32) || CI->getType()->isIntegerTy(64)))
+        fail("i8/i16/i32/i64 integer aggregate constants");
       storeIntegerBytes(CI->getValue(), Bytes.size(), Bytes);
       return;
     }
@@ -402,6 +406,21 @@ class OS400MIEmitPass : public ModulePass {
     CmpInst::Predicate Predicate;
     std::string LHS;
     std::string RHS;
+  };
+
+  struct I64Value {
+    std::string Bytes;
+    std::string Hi;
+    std::string HiU;
+    std::string Lo;
+    std::string LoBytes;
+    std::array<std::string, 8> Byte;
+  };
+
+  struct I64CompareValue {
+    CmpInst::Predicate Predicate;
+    I64Value LHS;
+    I64Value RHS;
   };
 
   struct MapRecord {
@@ -710,19 +729,19 @@ class OS400MIEmitPass : public ModulePass {
       const auto *CI = dyn_cast<ConstantInt>(GV.getInitializer());
       if (!CI || !(CI->getType()->isIntegerTy(8) ||
                    CI->getType()->isIntegerTy(16) ||
-                   CI->getType()->isIntegerTy(32)))
-        fail("i8/i16/i32 globals with constant integer initializers");
+                   CI->getType()->isIntegerTy(32) ||
+                   CI->getType()->isIntegerTy(64)))
+        fail("i8/i16/i32/i64 globals with constant integer initializers");
 
       AccessWidth Width = getIntegerAccessWidth(CI->getType());
       uint32_t Size = getAccessWidthBytes(Width);
-      uint32_t Alignment = Width == AccessWidth::I8 ? 1 : Size;
+      uint32_t Alignment = Width == AccessWidth::I8 ? 1 : std::min(Size, 4U);
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
       if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
-      int32_t InitialValue = static_cast<int32_t>(CI->getSExtValue());
       if (Width == AccessWidth::I8) {
         std::string Hex;
         raw_string_ostream HexOS(Hex);
@@ -737,13 +756,21 @@ class OS400MIEmitPass : public ModulePass {
                                std::to_string(Offset + 1) + ") INIT(" +
                                std::to_string(CI->getZExtValue() & 0xFFFF) +
                                ");");
-      } else {
+      } else if (Width == AccessWidth::I32) {
+        int32_t InitialValue = static_cast<int32_t>(CI->getSExtValue());
         Declarations.push_back("DCL     DD          " + Name.Name +
                                "    BIN(4)     DEF(C_MEM) POS(" +
                                std::to_string(Offset + 1) + ") INIT(" +
                                std::to_string(InitialValue) + ");");
+      } else {
+        SmallVector<uint8_t, 8> Bytes(Size, 0);
+        storeIntegerBytes(CI->getValue(), Size, Bytes);
+        Declarations.push_back("DCL DD " + Name.Name + " CHAR(8) DEF(C_MEM) POS(" +
+                               std::to_string(Offset + 1) + ") INIT(X'" +
+                               getRawHex(Bytes) + "');");
       }
-      addGlobalObject(GV, Name, "global", Offset, Size, Alignment, Width, true);
+      addGlobalObject(GV, Name, "global", Offset, Size, Alignment, Width,
+                      Width != AccessWidth::I64);
       addMapRecord(Name, "global", std::move(Original), Offset, Size, Alignment,
                    getSourceLocation(GV));
       NextArenaOffset = Offset + Size;
@@ -812,7 +839,7 @@ class OS400MIEmitPass : public ModulePass {
 
         Type *ValueTy = GV.getValueType();
         if (ValueTy->isIntegerTy(8) || ValueTy->isIntegerTy(16) ||
-            ValueTy->isIntegerTy(32)) {
+            ValueTy->isIntegerTy(32) || ValueTy->isIntegerTy(64)) {
           layoutIntegerGlobal(GV);
           continue;
         }
@@ -833,7 +860,7 @@ class OS400MIEmitPass : public ModulePass {
           continue;
         }
 
-        fail("i8/i16/i32 globals, constant i8 string globals, and integer "
+        fail("i8/i16/i32/i64 globals, constant i8 string globals, and integer "
              "array/struct globals");
       }
     }
@@ -866,9 +893,11 @@ class OS400MIEmitPass : public ModulePass {
     const DataLayout &DL;
     const ArenaLayout &Layout;
     DenseMap<const Value *, std::string> Values;
+    DenseMap<const Value *, I64Value> I64Values;
     DenseMap<const Value *, ArenaSlot> AggregateValues;
     DenseMap<const Value *, std::string> SignedNarrowValues;
     DenseMap<const Value *, CompareValue> Comparisons;
+    DenseMap<const Value *, I64CompareValue> I64Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
     DenseMap<const BasicBlock *, std::string> BlockLabels;
     DenseMap<const BasicBlock *, SmallVector<const PHINode *, 2>> BlockPHIs;
@@ -883,12 +912,12 @@ class OS400MIEmitPass : public ModulePass {
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
     static bool isSupportedInt(Type *Ty) {
       return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
-                    Ty->isIntegerTy(32));
+                    Ty->isIntegerTy(32) || Ty->isIntegerTy(64));
     }
 
     static bool isSupportedCompareInt(Type *Ty) {
       return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
-                    Ty->isIntegerTy(32));
+                    Ty->isIntegerTy(32) || Ty->isIntegerTy(64));
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
@@ -929,7 +958,9 @@ class OS400MIEmitPass : public ModulePass {
 
     std::string getOperandName(const Value *V) const {
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
-        if (!CI->getType()->isIntegerTy(1) && !isSupportedInt(CI->getType()))
+        if (!CI->getType()->isIntegerTy(1) &&
+            !(CI->getType()->isIntegerTy(8) || CI->getType()->isIntegerTy(16) ||
+              CI->getType()->isIntegerTy(32)))
           fail("i1/i8/i16/i32 constants in lowered expressions");
         if (CI->getType()->isIntegerTy(1))
           return CI->isOne() ? "1" : "0";
@@ -939,6 +970,19 @@ class OS400MIEmitPass : public ModulePass {
       auto It = Values.find(V);
       if (It == Values.end())
         fail("operands defined by previous supported i32 instructions");
+      return It->second;
+    }
+
+    I64Value getI64Operand(const Value *V) {
+      if (!V->getType()->isIntegerTy(64))
+        fail("i64 operands");
+
+      if (const auto *CI = dyn_cast<ConstantInt>(V))
+        return materializeI64Constant(*CI);
+
+      auto It = I64Values.find(V);
+      if (It == I64Values.end())
+        fail("operands defined by previous supported i64 instructions");
       return It->second;
     }
 
@@ -1112,6 +1156,85 @@ class OS400MIEmitPass : public ModulePass {
       return Name.Name;
     }
 
+    I64Value createI64Temp(const Value &V, StringRef Kind = "i64_temp") {
+      std::string Original = getOriginalName(V);
+      GeneratedName Name = Names.createTempName(Original);
+      I64Value Temp;
+      Temp.Bytes = Name.Name;
+      Temp.Hi = Name.Name + "H";
+      Temp.HiU = Name.Name + "U";
+      Temp.Lo = Name.Name + "L";
+      Temp.LoBytes = Name.Name + "LB";
+      for (unsigned I = 0; I != 8; ++I)
+        Temp.Byte[I] = formatv("{0}B{1}", Name.Name, I + 1).str();
+
+      Declarations.push_back("DCL     DD          " + Temp.Bytes +
+                             "    CHAR(8);");
+      Declarations.push_back("DCL     DD          " + Temp.Hi +
+                             "    BIN(4)     DEF(" + Temp.Bytes + ") POS(1);");
+      Declarations.push_back("DCL     DD          " + Temp.HiU +
+                             "    BIN(4)     UNSGND DEF(" + Temp.Bytes +
+                             ") POS(1);");
+      Declarations.push_back("DCL     DD          " + Temp.Lo +
+                             "    BIN(4)     UNSGND DEF(" + Temp.Bytes +
+                             ") POS(5);");
+      Declarations.push_back("DCL     DD          " + Temp.LoBytes +
+                             "   CHAR(4)    DEF(" + Temp.Bytes + ") POS(5);");
+      for (unsigned I = 0; I != 8; ++I)
+        Declarations.push_back("DCL     DD          " + Temp.Byte[I] +
+                               "   CHAR(1)    DEF(" + Temp.Bytes + ") POS(" +
+                               std::to_string(I + 1) + ");");
+
+      addMapRecord(Name, Kind.str(), std::move(Original),
+                   isa<Instruction>(&V)
+                       ? getSourceLocation(cast<Instruction>(V))
+                       : std::nullopt,
+                   std::nullopt, 8, 4);
+      return Temp;
+    }
+
+    I64Value createAnonymousI64Temp(StringRef Kind) {
+      GeneratedName Name = Names.createTempName();
+      I64Value Temp;
+      Temp.Bytes = Name.Name;
+      Temp.Hi = Name.Name + "H";
+      Temp.HiU = Name.Name + "U";
+      Temp.Lo = Name.Name + "L";
+      Temp.LoBytes = Name.Name + "LB";
+      for (unsigned I = 0; I != 8; ++I)
+        Temp.Byte[I] = formatv("{0}B{1}", Name.Name, I + 1).str();
+
+      Declarations.push_back("DCL     DD          " + Temp.Bytes +
+                             "    CHAR(8);");
+      Declarations.push_back("DCL     DD          " + Temp.Hi +
+                             "    BIN(4)     DEF(" + Temp.Bytes + ") POS(1);");
+      Declarations.push_back("DCL     DD          " + Temp.HiU +
+                             "    BIN(4)     UNSGND DEF(" + Temp.Bytes +
+                             ") POS(1);");
+      Declarations.push_back("DCL     DD          " + Temp.Lo +
+                             "    BIN(4)     UNSGND DEF(" + Temp.Bytes +
+                             ") POS(5);");
+      Declarations.push_back("DCL     DD          " + Temp.LoBytes +
+                             "   CHAR(4)    DEF(" + Temp.Bytes + ") POS(5);");
+      for (unsigned I = 0; I != 8; ++I)
+        Declarations.push_back("DCL     DD          " + Temp.Byte[I] +
+                               "   CHAR(1)    DEF(" + Temp.Bytes + ") POS(" +
+                               std::to_string(I + 1) + ");");
+
+      addMapRecord(Name, Kind.str(), "", std::nullopt, std::nullopt, 8, 4);
+      return Temp;
+    }
+
+    I64Value materializeI64Constant(const ConstantInt &CI,
+                                    StringRef Kind = "i64_const") {
+      I64Value Temp = createAnonymousI64Temp(Kind);
+      SmallVector<uint8_t, 8> Bytes(8, 0);
+      storeIntegerBytes(CI.getValue(), 8, Bytes);
+      Body.push_back("        CPYBLA      " + Temp.Bytes + ",X'" +
+                     getRawHex(Bytes) + "';");
+      return Temp;
+    }
+
     ArenaSlot createAggregateTemp(const Value &V, Type *Ty, StringRef Kind) {
       if (!isSupportedArenaValueType(Ty))
         fail("integer array/struct aggregate values");
@@ -1192,6 +1315,83 @@ class OS400MIEmitPass : public ModulePass {
       return std::to_string(Amount);
     }
 
+    static std::string getConstantShiftAmount(const Value *V, unsigned Bits) {
+      const auto *CI = dyn_cast<ConstantInt>(V);
+      if (!CI)
+        fail("constant shift amounts");
+      uint64_t Amount = CI->getZExtValue();
+      if (Amount >= Bits)
+        fail("shift amounts in range");
+      return std::to_string(Amount);
+    }
+
+    void emitI64Add(const I64Value &Dest, const I64Value &LHS,
+                    const I64Value &RHS) {
+      GeneratedName NoCarryName = Names.createBlockName();
+      std::string NoCarry = NoCarryName.Name;
+      addMapRecord(NoCarryName, "i64_add_no_carry", "", std::nullopt);
+
+      Body.push_back("        ADDN        " + Dest.Lo + "," + LHS.Lo + "," +
+                     RHS.Lo + ";");
+      Body.push_back("        ADDN        " + Dest.Hi + "," + LHS.Hi + "," +
+                     RHS.Hi + ";");
+      Body.push_back("        CMPNV(B)    " + Dest.Lo + "," + LHS.Lo +
+                     "/NLO(" + NoCarry + ");");
+      Body.push_back("        ADDN        " + Dest.Hi + "," + Dest.Hi +
+                     ",1;");
+      Body.push_back(NoCarry + ":");
+    }
+
+    void emitI64Sub(const I64Value &Dest, const I64Value &LHS,
+                    const I64Value &RHS) {
+      GeneratedName NoBorrowName = Names.createBlockName();
+      std::string NoBorrow = NoBorrowName.Name;
+      addMapRecord(NoBorrowName, "i64_sub_no_borrow", "", std::nullopt);
+
+      Body.push_back("        SUBN        " + Dest.Lo + "," + LHS.Lo + "," +
+                     RHS.Lo + ";");
+      Body.push_back("        SUBN        " + Dest.Hi + "," + LHS.Hi + "," +
+                     RHS.Hi + ";");
+      Body.push_back("        CMPNV(B)    " + LHS.Lo + "," + RHS.Lo +
+                     "/NLO(" + NoBorrow + ");");
+      Body.push_back("        SUBN        " + Dest.Hi + "," + Dest.Hi +
+                     ",1;");
+      Body.push_back(NoBorrow + ":");
+    }
+
+    void lowerI64BinaryOperator(const BinaryOperator &BO) {
+      I64Value Dest = createI64Temp(BO);
+      I64Value LHS = getI64Operand(BO.getOperand(0));
+
+      switch (BO.getOpcode()) {
+      case Instruction::Add:
+        emitI64Add(Dest, LHS, getI64Operand(BO.getOperand(1)));
+        break;
+      case Instruction::Sub:
+        emitI64Sub(Dest, LHS, getI64Operand(BO.getOperand(1)));
+        break;
+      case Instruction::Shl:
+        Body.push_back("        CPYBTLLS    " + Dest.Bytes + "," + LHS.Bytes +
+                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
+                       ";");
+        break;
+      case Instruction::LShr:
+        Body.push_back("        CPYBTRLS    " + Dest.Bytes + "," + LHS.Bytes +
+                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
+                       ";");
+        break;
+      case Instruction::AShr:
+        Body.push_back("        CPYBTRAS    " + Dest.Bytes + "," + LHS.Bytes +
+                       "," + getConstantShiftAmount(BO.getOperand(1), 64) +
+                       ";");
+        break;
+      default:
+        fail("i64 add/sub and constant shift expressions");
+      }
+
+      I64Values[&BO] = Dest;
+    }
+
     void lowerAlloca(const AllocaInst &AI) {
       if (AI.isArrayAllocation())
         fail("static scalar or integer aggregate allocas");
@@ -1218,7 +1418,8 @@ class OS400MIEmitPass : public ModulePass {
 
       std::string Original = getOriginalName(AI);
       GeneratedName SlotName = Names.createSlotName(Original);
-      ArenaSlot Slot{SlotName.Name, Offset, Size, Width, ScalarInt};
+      ArenaSlot Slot{SlotName.Name, Offset, Size, Width,
+                     ScalarInt && Width != AccessWidth::I64};
       NextArenaOffset = Offset + Size;
       Slots[&AI] = Slot;
       if (ScalarInt && Width == AccessWidth::I32) {
@@ -1240,6 +1441,11 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
+      if (BO.getType()->isIntegerTy(64)) {
+        lowerI64BinaryOperator(BO);
+        return;
+      }
+
       if (!isI32(BO.getType()))
         fail("i32 arithmetic, bitwise, and constant shift expressions");
 
@@ -1307,12 +1513,123 @@ class OS400MIEmitPass : public ModulePass {
     void lowerICmp(const ICmpInst &ICI) {
       if (!isSupportedCompareInt(ICI.getOperand(0)->getType()) ||
           ICI.getOperand(0)->getType() != ICI.getOperand(1)->getType())
-        fail("i8/i16/i32 icmp expressions");
+        fail("i8/i16/i32/i64 icmp expressions");
+
+      if (ICI.getOperand(0)->getType()->isIntegerTy(64)) {
+        I64Comparisons[&ICI] = {ICI.getPredicate(),
+                                getI64Operand(ICI.getOperand(0)),
+                                getI64Operand(ICI.getOperand(1))};
+        return;
+      }
 
       Comparisons[&ICI] = {
           ICI.getPredicate(),
           getCompareOperandName(ICI.getOperand(0), ICI.isSigned()),
           getCompareOperandName(ICI.getOperand(1), ICI.isSigned())};
+    }
+
+    void emitI64CompareTrueBranch(const I64CompareValue &Cmp,
+                                  StringRef TrueLabel,
+                                  StringRef DoneLabel) {
+      auto EmitHighLowOrdering = [&](StringRef HiLHS, StringRef HiRHS,
+                                     StringRef LowPredicate) {
+        Body.push_back("        CMPNV(B)    " + HiLHS.str() + "," +
+                       HiRHS.str() + "/LO(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + HiLHS.str() + "," +
+                       HiRHS.str() + "/HI(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/" + LowPredicate.str() + "(" +
+                       TrueLabel.str() + ");");
+      };
+
+      switch (Cmp.Predicate) {
+      case CmpInst::ICMP_EQ:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/NEQ(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/EQ(" + TrueLabel.str() + ");");
+        break;
+      case CmpInst::ICMP_NE:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/NEQ(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/NEQ(" + TrueLabel.str() + ");");
+        break;
+      case CmpInst::ICMP_SLT:
+        EmitHighLowOrdering(Cmp.LHS.Hi, Cmp.RHS.Hi, "LO");
+        break;
+      case CmpInst::ICMP_SLE:
+        EmitHighLowOrdering(Cmp.LHS.Hi, Cmp.RHS.Hi, "NHI");
+        break;
+      case CmpInst::ICMP_SGT:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/HI(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/LO(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/HI(" + TrueLabel.str() + ");");
+        break;
+      case CmpInst::ICMP_SGE:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/HI(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Hi + "," +
+                       Cmp.RHS.Hi + "/LO(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/NLO(" + TrueLabel.str() + ");");
+        break;
+      case CmpInst::ICMP_ULT:
+        EmitHighLowOrdering(Cmp.LHS.HiU, Cmp.RHS.HiU, "LO");
+        break;
+      case CmpInst::ICMP_ULE:
+        EmitHighLowOrdering(Cmp.LHS.HiU, Cmp.RHS.HiU, "NHI");
+        break;
+      case CmpInst::ICMP_UGT:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.HiU + "," +
+                       Cmp.RHS.HiU + "/HI(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.HiU + "," +
+                       Cmp.RHS.HiU + "/LO(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/HI(" + TrueLabel.str() + ");");
+        break;
+      case CmpInst::ICMP_UGE:
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.HiU + "," +
+                       Cmp.RHS.HiU + "/HI(" + TrueLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.HiU + "," +
+                       Cmp.RHS.HiU + "/LO(" + DoneLabel.str() + ");");
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS.Lo + "," +
+                       Cmp.RHS.Lo + "/NLO(" + TrueLabel.str() + ");");
+        break;
+      default:
+        fail("i64 icmp predicates");
+      }
+    }
+
+    std::string materializeI64Compare(const ICmpInst &ICI) {
+      auto Existing = Values.find(&ICI);
+      if (Existing != Values.end())
+        return Existing->second;
+
+      auto It = I64Comparisons.find(&ICI);
+      if (It == I64Comparisons.end()) {
+        lowerICmp(ICI);
+        It = I64Comparisons.find(&ICI);
+      }
+
+      std::string Dest = createTemp(ICI);
+      GeneratedName TrueName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string TrueLabel = TrueName.Name;
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(TrueName, "i64_bool_true", "", getSourceLocation(ICI));
+      addMapRecord(DoneName, "i64_bool_done", "", getSourceLocation(ICI));
+      Body.push_back("        CPYNV       " + Dest + ",0;");
+      emitI64CompareTrueBranch(It->second, TrueLabel, DoneLabel);
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(TrueLabel + ":");
+      Body.push_back("        CPYNV       " + Dest + ",1;");
+      Body.push_back(DoneLabel + ":");
+      Values[&ICI] = Dest;
+      return Dest;
     }
 
     std::string materializeBoolean(const Value *V) {
@@ -1323,7 +1640,9 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       if (const auto *ICI = dyn_cast<ICmpInst>(V))
-        return materializeCompare(*ICI);
+        return ICI->getOperand(0)->getType()->isIntegerTy(64)
+                   ? materializeI64Compare(*ICI)
+                   : materializeCompare(*ICI);
 
       auto It = Values.find(V);
       if (It == Values.end())
@@ -1344,6 +1663,13 @@ class OS400MIEmitPass : public ModulePass {
         const CompareValue &Cmp = It->second;
         Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
                        getBranchPredicate(Cmp.Predicate).str() + "(" +
+                       TrueLabel.str() + ");");
+        return;
+      }
+
+      if (auto It = I64Comparisons.find(Cond); It != I64Comparisons.end()) {
+        std::string Bool = materializeBoolean(Cond);
+        Body.push_back("        CMPNV(B)    " + Bool + ",0/NEQ(" +
                        TrueLabel.str() + ");");
         return;
       }
@@ -1525,6 +1851,8 @@ class OS400MIEmitPass : public ModulePass {
         return "LS_I2";
       case AccessWidth::I32:
         return "LS_I4";
+      case AccessWidth::I64:
+        fail("i64 direct load/store lens");
       }
       llvm_unreachable("unknown access width");
     }
@@ -1668,6 +1996,20 @@ class OS400MIEmitPass : public ModulePass {
       emitFillBytesByOffset(getPointerOffsetName(DestPtr), Size, Byte);
     }
 
+    void emitLoadI64FromOffset(const I64Value &Dest, StringRef SourceBase) {
+      for (uint64_t I = 0; I != 8; ++I) {
+        emitSetLensPointerFromOffset(getPointerOffsetPlus(SourceBase, I));
+        Body.push_back("        CPYBLA      " + Dest.Byte[I] + ",LS_I1;");
+      }
+    }
+
+    void emitStoreI64ToOffset(StringRef DestBase, const I64Value &Source) {
+      for (uint64_t I = 0; I != 8; ++I) {
+        emitSetLensPointerFromOffset(getPointerOffsetPlus(DestBase, I));
+        Body.push_back("        CPYBLA      LS_I1," + Source.Byte[I] + ";");
+      }
+    }
+
     static uint64_t getConstantLength(const Value *V) {
       const auto *CI = dyn_cast<ConstantInt>(V);
       if (!CI)
@@ -1687,6 +2029,13 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerStore(const StoreInst &SI) {
       Type *ValueTy = SI.getValueOperand()->getType();
+      if (ValueTy->isIntegerTy(64)) {
+        I64Value Source = getI64Operand(SI.getValueOperand());
+        emitStoreI64ToOffset(getPointerOffsetName(SI.getPointerOperand()),
+                             Source);
+        return;
+      }
+
       if (!isSupportedInt(ValueTy)) {
         auto AggIt = AggregateValues.find(SI.getValueOperand());
         if (AggIt != AggregateValues.end()) {
@@ -1718,6 +2067,13 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerLoad(const LoadInst &LI) {
+      if (LI.getType()->isIntegerTy(64)) {
+        I64Value Dest = createI64Temp(LI);
+        emitLoadI64FromOffset(Dest, getPointerOffsetName(LI.getPointerOperand()));
+        I64Values[&LI] = Dest;
+        return;
+      }
+
       if (!isSupportedInt(LI.getType())) {
         ArenaSlot Slot = createAggregateTemp(LI, LI.getType(), "aggregate_temp");
         emitCopyBytesByOffset(std::to_string(Slot.Offset),
@@ -1756,6 +2112,13 @@ class OS400MIEmitPass : public ModulePass {
                            EVI.getIndices());
 
       if (isSupportedInt(ResultTy)) {
+        if (ResultTy->isIntegerTy(64)) {
+          I64Value Dest = createI64Temp(EVI);
+          emitLoadI64FromOffset(Dest, std::to_string(Offset));
+          I64Values[&EVI] = Dest;
+          return;
+        }
+
         AccessWidth Width = getAccessWidth(ResultTy);
         std::string Dest = createTemp(EVI);
         emitSetLensPointerFromOffset(std::to_string(Offset));
@@ -1803,6 +2166,12 @@ class OS400MIEmitPass : public ModulePass {
       uint64_t Offset = Slot.Offset + getIndexedOffset(AggTy, IVI.getIndices());
       const Value *Inserted = IVI.getInsertedValueOperand();
       if (isSupportedInt(Inserted->getType())) {
+        if (Inserted->getType()->isIntegerTy(64)) {
+          emitStoreI64ToOffset(std::to_string(Offset), getI64Operand(Inserted));
+          AggregateValues[&IVI] = Slot;
+          return;
+        }
+
         AccessWidth Width = getAccessWidth(Inserted->getType());
         emitSetLensPointerFromOffset(std::to_string(Offset));
         emitStoreToReference(getLensName(Width), Width, Inserted);
@@ -1820,13 +2189,41 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerZExt(const ZExtInst &ZI) {
       Type *SrcTy = ZI.getOperand(0)->getType();
+      if (ZI.getType()->isIntegerTy(64)) {
+        if (!(SrcTy->isIntegerTy(1) || SrcTy->isIntegerTy(8) ||
+              SrcTy->isIntegerTy(16) || SrcTy->isIntegerTy(32)))
+          fail("zext from i1/i8/i16/i32 to i64");
+
+        if (const auto *CI = dyn_cast<ConstantInt>(ZI.getOperand(0))) {
+          auto *DestTy = cast<IntegerType>(ZI.getType());
+          I64Value Dest = materializeI64Constant(
+              *cast<ConstantInt>(
+                  ConstantInt::get(DestTy, CI->getValue().zext(64))));
+          I64Values[&ZI] = Dest;
+          return;
+        }
+
+        I64Value Dest = createI64Temp(ZI);
+        Body.push_back("        CPYBLA      " + Dest.Bytes + ",X'0000000000000000';");
+        if (SrcTy->isIntegerTy(32))
+          Body.push_back("        CPYBLA      " + Dest.LoBytes + "," +
+                         getI32ByteOperandName(ZI.getOperand(0)) + ";");
+        else
+          Body.push_back("        CPYNV       " + Dest.Lo + "," +
+                         getOperandName(ZI.getOperand(0)) + ";");
+        I64Values[&ZI] = Dest;
+        return;
+      }
+
       if (!ZI.getType()->isIntegerTy(32) ||
           !(SrcTy->isIntegerTy(1) || SrcTy->isIntegerTy(8) ||
             SrcTy->isIntegerTy(16)))
         fail("zext from i1/i8/i16 to i32");
 
       if (const auto *ICI = dyn_cast<ICmpInst>(ZI.getOperand(0))) {
-        Values[&ZI] = materializeCompare(*ICI);
+        Values[&ZI] = ICI->getOperand(0)->getType()->isIntegerTy(64)
+                          ? materializeI64Compare(*ICI)
+                          : materializeCompare(*ICI);
         return;
       }
 
@@ -1835,6 +2232,43 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerSExt(const SExtInst &SI) {
       Type *SrcTy = SI.getOperand(0)->getType();
+      if (SI.getType()->isIntegerTy(64)) {
+        if (!(SrcTy->isIntegerTy(8) || SrcTy->isIntegerTy(16) ||
+              SrcTy->isIntegerTy(32)))
+          fail("sext from i8/i16/i32 to i64");
+
+        if (const auto *CI = dyn_cast<ConstantInt>(SI.getOperand(0))) {
+          auto *DestTy = cast<IntegerType>(SI.getType());
+          I64Value Dest = materializeI64Constant(
+              *cast<ConstantInt>(
+                  ConstantInt::get(DestTy, CI->getValue().sext(64))));
+          I64Values[&SI] = Dest;
+          return;
+        }
+
+        const Value *Source = SI.getOperand(0);
+        std::string Src =
+            SrcTy->isIntegerTy(32) ? getOperandName(Source)
+                                   : materializeSignedNarrowOperand(Source);
+        I64Value Dest = createI64Temp(SI);
+        GeneratedName DoneName = Names.createBlockName();
+        std::string DoneLabel = DoneName.Name;
+        addMapRecord(DoneName, "i64_sext_done", "", getSourceLocation(SI));
+        Body.push_back("        CPYBLA      " + Dest.Bytes + ",X'0000000000000000';");
+        if (SrcTy->isIntegerTy(32))
+          Body.push_back("        CPYBLA      " + Dest.LoBytes + "," +
+                         getI32ByteOperandName(Source) + ";");
+        else
+          Body.push_back("        CPYBLA      " + Dest.LoBytes + "," + Src +
+                         "B;");
+        Body.push_back("        CMPNV(B)    " + Src + ",0/NLO(" + DoneLabel +
+                       ");");
+        Body.push_back("        CPYNV       " + Dest.Hi + ",-1;");
+        Body.push_back(DoneLabel + ":");
+        I64Values[&SI] = Dest;
+        return;
+      }
+
       if (!SI.getType()->isIntegerTy(32) ||
           !(SrcTy->isIntegerTy(8) || SrcTy->isIntegerTy(16)))
         fail("sext from i8/i16 to i32");
@@ -1861,7 +2295,38 @@ class OS400MIEmitPass : public ModulePass {
       Values[&SI] = Dest;
     }
 
+    void lowerTrunc(const TruncInst &TI) {
+      if (!TI.getOperand(0)->getType()->isIntegerTy(64) ||
+          !TI.getType()->isIntegerTy(32))
+        fail("trunc from i64 to i32");
+
+      I64Value Src = getI64Operand(TI.getOperand(0));
+      std::string Dest = createTemp(TI);
+      Body.push_back("        CPYBLA      " + Dest + "B," + Src.LoBytes + ";");
+      Values[&TI] = Dest;
+    }
+
     void lowerSelect(const SelectInst &SI) {
+      if (SI.getType()->isIntegerTy(64)) {
+        I64Value Dest = createI64Temp(SI);
+        GeneratedName TrueName = Names.createBlockName();
+        GeneratedName DoneName = Names.createBlockName();
+        std::string TrueLabel = TrueName.Name;
+        std::string DoneLabel = DoneName.Name;
+        addMapRecord(TrueName, "select_true", "", getSourceLocation(SI));
+        addMapRecord(DoneName, "select_done", "", getSourceLocation(SI));
+        Body.push_back("        CPYBLA      " + Dest.Bytes + "," +
+                       getI64Operand(SI.getFalseValue()).Bytes + ";");
+        emitBranchOnCondition(SI.getCondition(), TrueLabel);
+        Body.push_back("        B           " + DoneLabel + ";");
+        Body.push_back(TrueLabel + ":");
+        Body.push_back("        CPYBLA      " + Dest.Bytes + "," +
+                       getI64Operand(SI.getTrueValue()).Bytes + ";");
+        Body.push_back(DoneLabel + ":");
+        I64Values[&SI] = Dest;
+        return;
+      }
+
       if (!SI.getType()->isIntegerTy(1) && !isI32(SI.getType()))
         fail("i1/i32 select values");
       std::string Dest = createTemp(SI);
@@ -1920,8 +2385,13 @@ class OS400MIEmitPass : public ModulePass {
       EdgeBlocks.push_back(EdgeLabel + ":");
       for (const PHINode *PN : BlockPHIs[Succ]) {
         Value *Incoming = PN->getIncomingValueForBlock(Pred);
-        EdgeBlocks.push_back("        CPYNV       " + getOperandName(PN) + "," +
-                             getOperandName(Incoming) + ";");
+        if (PN->getType()->isIntegerTy(64))
+          EdgeBlocks.push_back("        CPYBLA      " +
+                               getI64Operand(PN).Bytes + "," +
+                               getI64Operand(Incoming).Bytes + ";");
+        else
+          EdgeBlocks.push_back("        CPYNV       " + getOperandName(PN) +
+                               "," + getOperandName(Incoming) + ";");
       }
       EdgeBlocks.push_back("        B           " + getBlockLabel(Succ) + ";");
       return EdgeLabel;
@@ -1940,10 +2410,14 @@ class OS400MIEmitPass : public ModulePass {
                      getSourceLocation(BB));
         BlockLabels[&BB] = Label.Name;
         for (const PHINode &PN : BB.phis()) {
-          if (!PN.getType()->isIntegerTy(1) && !isI32(PN.getType()))
-            fail("i1/i32 phi nodes");
+          if (!PN.getType()->isIntegerTy(1) && !isI32(PN.getType()) &&
+              !PN.getType()->isIntegerTy(64))
+            fail("i1/i32/i64 phi nodes");
           BlockPHIs[&BB].push_back(&PN);
-          Values[&PN] = createTemp(PN);
+          if (PN.getType()->isIntegerTy(64))
+            I64Values[&PN] = createI64Temp(PN);
+          else
+            Values[&PN] = createTemp(PN);
         }
       }
 
@@ -1969,6 +2443,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerZExt(*ZI);
           } else if (const auto *SI = dyn_cast<SExtInst>(&I)) {
             lowerSExt(*SI);
+          } else if (const auto *TI = dyn_cast<TruncInst>(&I)) {
+            lowerTrunc(*TI);
           } else if (const auto *SI = dyn_cast<SelectInst>(&I)) {
             lowerSelect(*SI);
           } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {

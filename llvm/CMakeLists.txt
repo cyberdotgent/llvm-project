@@ -603,6 +603,7 @@ set(LLVM_ALL_EXPERIMENTAL_TARGETS
   CSKY
   DirectX
   M68k
+  OS400MI
   Xtensa
 )
 

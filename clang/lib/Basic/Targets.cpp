@@ -28,6 +28,7 @@
 #include "Targets/MSP430.h"
 #include "Targets/Mips.h"
 #include "Targets/NVPTX.h"
+#include "Targets/OS400MI.h"
 #include "Targets/OSTargets.h"
 #include "Targets/PPC.h"
 #include "Targets/RISCV.h"
@@ -283,6 +284,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
 
   case llvm::Triple::msp430:
     return std::make_unique<MSP430TargetInfo>(Triple, Opts);
+  case llvm::Triple::os400mi:
+    return std::make_unique<OS400MITargetInfo>(Triple, Opts);
 
   case llvm::Triple::mips:
     switch (os) {

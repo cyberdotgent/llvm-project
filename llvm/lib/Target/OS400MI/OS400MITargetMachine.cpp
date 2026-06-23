@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "TargetInfo/OS400MITargetInfo.h"
+#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
@@ -21,6 +22,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CodeGen.h"
@@ -28,8 +33,10 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/TargetParser/Triple.h"
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 using namespace llvm;
@@ -37,16 +44,27 @@ using namespace llvm;
 namespace {
 
 class OS400MITargetMachine : public TargetMachine {
+  std::unique_ptr<TargetLoweringObjectFile> TLOF;
+
 public:
   OS400MITargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                        StringRef FS, const TargetOptions &Options,
                        std::optional<Reloc::Model> RM,
                        std::optional<CodeModel::Model> CM, CodeGenOptLevel OL,
                        bool JIT)
-      : TargetMachine(T, TT.computeDataLayout(), TT, CPU, FS, Options) {
+      : TargetMachine(T, TT.computeDataLayout(), TT, CPU, FS, Options),
+        TLOF(std::make_unique<TargetLoweringObjectFileELF>()) {
     this->RM = RM.value_or(Reloc::Static);
     this->CMModel = CM.value_or(CodeModel::Small);
     this->OptLevel = OL;
+    this->MRI.reset(T.createMCRegInfo(TT));
+    this->MII.reset(T.createMCInstrInfo());
+    this->STI.reset(T.createMCSubtargetInfo(TT, CPU, FS));
+    this->AsmInfo.reset(T.createMCAsmInfo(*MRI, TT, Options.MCOptions));
+  }
+
+  TargetLoweringObjectFile *getObjFileLowering() const override {
+    return TLOF.get();
   }
 
   bool addPassesToEmitFile(PassManagerBase &PM, raw_pwrite_stream &Out,

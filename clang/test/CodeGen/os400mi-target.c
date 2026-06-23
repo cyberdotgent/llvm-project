@@ -1,7 +1,7 @@
 // RUN: %clang_cc1 -triple os400mi-ibm-os400 -emit-llvm -o - %s | FileCheck %s
 // RUN: %clang_cc1 -triple os400mi-ibm-os400 -E -dM -x c /dev/null | FileCheck --check-prefix=MACROS %s
 
-// CHECK: target datalayout = "E-p:32:32-i8:32:32-i16:32:32-i32:32:32-i64:32:32-n32-S32"
+// CHECK: target datalayout = "E-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:32-f32:32:32-f64:64:64-n32-S32"
 // CHECK: target triple = "os400mi-ibm-os400"
 
 // MACROS-DAG: #define __BYTE_ORDER__ __ORDER_BIG_ENDIAN__

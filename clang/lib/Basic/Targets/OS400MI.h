@@ -21,27 +21,31 @@ class LLVM_LIBRARY_VISIBILITY OS400MITargetInfo : public TargetInfo {
 public:
   OS400MITargetInfo(const llvm::Triple &Triple, const TargetOptions &)
       : TargetInfo(Triple) {
+    BigEndian = true;
     TLSSupported = false;
 
-    PointerWidth = 16;
-    PointerAlign = 16;
-    IntWidth = 16;
-    IntAlign = 16;
+    PointerWidth = 32;
+    PointerAlign = 32;
+    BoolAlign = 8;
+    ShortAlign = 16;
+    IntWidth = 32;
+    IntAlign = 32;
     LongWidth = 32;
-    LongAlign = 16;
+    LongAlign = 32;
     LongLongWidth = 64;
-    LongLongAlign = 16;
+    LongLongAlign = 32;
     FloatWidth = 32;
-    FloatAlign = 16;
+    FloatAlign = 32;
     DoubleWidth = LongDoubleWidth = 64;
-    DoubleAlign = LongDoubleAlign = 16;
-    SuitableAlign = 16;
+    DoubleAlign = LongDoubleAlign = 64;
+    SuitableAlign = 32;
 
-    SizeType = UnsignedInt;
-    PtrDiffType = SignedInt;
-    IntPtrType = SignedInt;
+    SizeType = UnsignedLong;
+    PtrDiffType = SignedLong;
+    IntPtrType = SignedLong;
     SigAtomicType = SignedInt;
-    resetDataLayout("E-p:16:16-i16:16-i32:16-i64:16-n16");
+    resetDataLayout("E-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-"
+                    "i64:32:32-f32:32:32-f64:64:64-n32-S32");
   }
 
   void getTargetDefines(const LangOptions &Opts,

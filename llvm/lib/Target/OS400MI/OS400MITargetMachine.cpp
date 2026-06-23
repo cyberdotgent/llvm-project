@@ -197,6 +197,8 @@ class OS400MIEmitPass : public ModulePass {
     std::string RHS;
   };
 
+  enum class AccessWidth : uint8_t { I8 = 1, I16 = 2, I32 = 4 };
+
   struct MapRecord {
     std::string MIName;
     std::string Kind;
@@ -477,8 +479,13 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<MapRecord, 16> MapRecords;
     uint32_t NextArenaOffset;
     bool HasLoadStoreLens = false;
+    bool HasU1Box = false;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
+    static bool isSupportedInt(Type *Ty) {
+      return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
+                    Ty->isIntegerTy(32));
+    }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
 
@@ -500,8 +507,8 @@ class OS400MIEmitPass : public ModulePass {
 
     std::string getOperandName(const Value *V) const {
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
-        if (!CI->getType()->isIntegerTy(32))
-          fail("i32 constants in lowered expressions");
+        if (!isSupportedInt(CI->getType()))
+          fail("i8/i16/i32 constants in lowered expressions");
         return std::to_string(static_cast<int32_t>(CI->getSExtValue()));
       }
 
@@ -526,7 +533,19 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     SPCPTR      .LS;");
       Declarations.push_back("DCL     DD          OFF       BIN(4);");
       Declarations.push_back("DCL     SPC         LOADSTORE BAS(.LS);");
+      Declarations.push_back("DCL     DD          LS_I1     CHAR(1)    DIR        POS(1);");
+      Declarations.push_back("DCL     DD          LS_I2     BIN(2)     UNSGND DIR POS(1);");
       Declarations.push_back("DCL     DD          LS_I4     BIN(4)     DIR        POS(1);");
+    }
+
+    void ensureU1Box() {
+      if (HasU1Box)
+        return;
+
+      HasU1Box = true;
+      Declarations.push_back("DCL     DD          U1_BOX    CHAR(4);");
+      Declarations.push_back("DCL     DD          U1_NUM    BIN(4)     DEF(U1_BOX) POS(1);");
+      Declarations.push_back("DCL     DD          U1_BYTE   CHAR(1)    DEF(U1_BOX) POS(4);");
     }
 
     static StringRef getBranchPredicate(CmpInst::Predicate Predicate) {
@@ -540,11 +559,17 @@ class OS400MIEmitPass : public ModulePass {
       case CmpInst::ICMP_SGT:
         return "HI";
       case CmpInst::ICMP_SLE:
+      case CmpInst::ICMP_ULE:
         return "NHI";
       case CmpInst::ICMP_SGE:
+      case CmpInst::ICMP_UGE:
         return "NLO";
+      case CmpInst::ICMP_ULT:
+        return "LO";
+      case CmpInst::ICMP_UGT:
+        return "HI";
       default:
-        fail("signed i32 icmp predicates");
+        fail("i32 icmp predicates");
         llvm_unreachable("fail should not return");
       }
     }
@@ -616,11 +641,12 @@ class OS400MIEmitPass : public ModulePass {
       if (ScalarI32) {
         Size = 4;
       } else if (const auto *AT = dyn_cast<ArrayType>(AllocatedTy)) {
-        if (!AT->getElementType()->isIntegerTy(32))
-          fail("static scalar or i32-array allocas");
-        Size = AT->getNumElements() * 4;
+        Type *EltTy = AT->getElementType();
+        if (!isSupportedInt(EltTy))
+          fail("static scalar or integer-array allocas");
+        Size = AT->getNumElements() * EltTy->getIntegerBitWidth() / 8;
       } else {
-        fail("static scalar or i32-array allocas");
+        fail("static scalar or integer-array allocas");
       }
 
       uint32_t Offset = alignTo4(NextArenaOffset);
@@ -675,6 +701,35 @@ class OS400MIEmitPass : public ModulePass {
 
       Comparisons[&ICI] = {ICI.getPredicate(), getOperandName(ICI.getOperand(0)),
                            getOperandName(ICI.getOperand(1))};
+    }
+
+    std::string materializeCompare(const ICmpInst &ICI) {
+      auto Existing = Values.find(&ICI);
+      if (Existing != Values.end())
+        return Existing->second;
+
+      auto It = Comparisons.find(&ICI);
+      if (It == Comparisons.end()) {
+        lowerICmp(ICI);
+        It = Comparisons.find(&ICI);
+      }
+
+      const CompareValue &Cmp = It->second;
+      std::string Dest = createTemp(ICI);
+      std::string TrueLabel = Names.createBlockName();
+      std::string DoneLabel = Names.createBlockName();
+      addMapRecord(TrueLabel, "bool_true");
+      addMapRecord(DoneLabel, "bool_done");
+      Body.push_back("        CPYNV       " + Dest + ",0;");
+      Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
+                     getBranchPredicate(Cmp.Predicate).str() + "(" +
+                     TrueLabel + ");");
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(TrueLabel + ":");
+      Body.push_back("        CPYNV       " + Dest + ",1;");
+      Body.push_back(DoneLabel + ":");
+      Values[&ICI] = Dest;
+      return Dest;
     }
 
     std::optional<std::string> tryGetPointerOffsetName(const Value *V) const {
@@ -749,8 +804,13 @@ class OS400MIEmitPass : public ModulePass {
         Body.push_back("        ADDN        " + Quad + "," + Twice + "," +
                        Twice + ";");
         DynamicOffset = Quad;
+      } else if (DynamicScale == 2) {
+        std::string Twice = createAnonymousTemp("ptr_offset");
+        Body.push_back("        ADDN        " + Twice + "," + DynamicOffset +
+                       "," + DynamicOffset + ";");
+        DynamicOffset = Twice;
       } else if (DynamicScale != 1) {
-        fail("dynamic getelementptr scale 1 or 4");
+        fail("dynamic getelementptr scale 1, 2, or 4");
       }
 
       if (StaticOffset == 0) {
@@ -764,9 +824,52 @@ class OS400MIEmitPass : public ModulePass {
       Values[&GEP] = Dest;
     }
 
+    AccessWidth getAccessWidth(Type *Ty) const {
+      if (Ty->isIntegerTy(8))
+        return AccessWidth::I8;
+      if (Ty->isIntegerTy(16))
+        return AccessWidth::I16;
+      if (Ty->isIntegerTy(32))
+        return AccessWidth::I32;
+      fail("i8/i16/i32 arena accesses");
+      llvm_unreachable("fail should not return");
+    }
+
+    static StringRef getLensName(AccessWidth Width) {
+      switch (Width) {
+      case AccessWidth::I8:
+        return "LS_I1";
+      case AccessWidth::I16:
+        return "LS_I2";
+      case AccessWidth::I32:
+        return "LS_I4";
+      }
+      llvm_unreachable("unknown access width");
+    }
+
+    void emitSetLensPointer(const Value *Ptr) {
+      ensureLoadStoreLens();
+      Body.push_back("        CPYNV       OFF," + getPointerOffsetName(Ptr) +
+                     ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+    }
+
+    static std::string getByteHex(const ConstantInt &CI) {
+      uint32_t Byte = CI.getZExtValue() & 0xFF;
+      const char Digits[] = "0123456789ABCDEF";
+      std::string Hex;
+      Hex.push_back(Digits[Byte >> 4]);
+      Hex.push_back(Digits[Byte & 0x0F]);
+      return Hex;
+    }
+
     void lowerStore(const StoreInst &SI) {
-      if (!isI32(SI.getValueOperand()->getType()))
-        fail("i32 stores");
+      Type *ValueTy = SI.getValueOperand()->getType();
+      AccessWidth Width = getAccessWidth(ValueTy);
+      if (Width != AccessWidth::I32 &&
+          dyn_cast<AllocaInst>(SI.getPointerOperand()))
+        fail("direct i8/i16 stores require dynamic arena lenses");
+
       if (std::optional<ArenaSlot> Slot =
               getConstantI32GlobalSlot(SI.getPointerOperand())) {
         Body.push_back("        CPYNV       " + Slot->Name + "," +
@@ -781,17 +884,31 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      ensureLoadStoreLens();
-      Body.push_back("        CPYNV       OFF," +
-                     getPointerOffsetName(SI.getPointerOperand()) + ";");
-      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
-      Body.push_back("        CPYNV       LS_I4," +
+      emitSetLensPointer(SI.getPointerOperand());
+      if (Width == AccessWidth::I8) {
+        if (const auto *CI = dyn_cast<ConstantInt>(SI.getValueOperand())) {
+          Body.push_back("        CPYBLA      LS_I1,X'" + getByteHex(*CI) +
+                         "';");
+          return;
+        }
+
+        ensureU1Box();
+        Body.push_back("        CPYNV       U1_NUM," +
+                       getOperandName(SI.getValueOperand()) + ";");
+        Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+        return;
+      }
+
+      Body.push_back("        CPYNV       " + getLensName(Width).str() + "," +
                      getOperandName(SI.getValueOperand()) + ";");
     }
 
     void lowerLoad(const LoadInst &LI) {
-      if (!isI32(LI.getType()))
-        fail("i32 loads");
+      AccessWidth Width = getAccessWidth(LI.getType());
+      if (Width != AccessWidth::I32 &&
+          dyn_cast<AllocaInst>(LI.getPointerOperand()))
+        fail("direct i8/i16 loads require dynamic arena lenses");
+
       std::string Dest = createTemp(LI);
       if (std::optional<ArenaSlot> Slot =
               getConstantI32GlobalSlot(LI.getPointerOperand())) {
@@ -807,12 +924,63 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      ensureLoadStoreLens();
-      Body.push_back("        CPYNV       OFF," +
-                     getPointerOffsetName(LI.getPointerOperand()) + ";");
-      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
-      Body.push_back("        CPYNV       " + Dest + ",LS_I4;");
+      emitSetLensPointer(LI.getPointerOperand());
+      if (Width == AccessWidth::I8) {
+        ensureU1Box();
+        Body.push_back("        CPYBLA      U1_BOX,X'00000000';");
+        Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+        Body.push_back("        CPYNV       " + Dest + ",U1_NUM;");
+      } else {
+        Body.push_back("        CPYNV       " + Dest + "," +
+                       getLensName(Width).str() + ";");
+      }
       Values[&LI] = Dest;
+    }
+
+    void lowerZExt(const ZExtInst &ZI) {
+      Type *SrcTy = ZI.getOperand(0)->getType();
+      if (!ZI.getType()->isIntegerTy(32) ||
+          !(SrcTy->isIntegerTy(1) || SrcTy->isIntegerTy(8) ||
+            SrcTy->isIntegerTy(16)))
+        fail("zext from i1/i8/i16 to i32");
+
+      if (const auto *ICI = dyn_cast<ICmpInst>(ZI.getOperand(0))) {
+        Values[&ZI] = materializeCompare(*ICI);
+        return;
+      }
+
+      Values[&ZI] = getOperandName(ZI.getOperand(0));
+    }
+
+    void lowerSelect(const SelectInst &SI) {
+      if (!isI32(SI.getType()))
+        fail("i32 select values");
+      const auto *ICI = dyn_cast<ICmpInst>(SI.getCondition());
+      if (!ICI)
+        fail("select directly from an i32 icmp");
+      auto It = Comparisons.find(ICI);
+      if (It == Comparisons.end()) {
+        lowerICmp(*ICI);
+        It = Comparisons.find(ICI);
+      }
+
+      const CompareValue &Cmp = It->second;
+      std::string Dest = createTemp(SI);
+      std::string TrueLabel = Names.createBlockName();
+      std::string DoneLabel = Names.createBlockName();
+      addMapRecord(TrueLabel, "select_true");
+      addMapRecord(DoneLabel, "select_done");
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getOperandName(SI.getFalseValue()) + ";");
+      Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
+                     getBranchPredicate(Cmp.Predicate).str() + "(" +
+                     TrueLabel + ");");
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(TrueLabel + ":");
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getOperandName(SI.getTrueValue()) + ";");
+      Body.push_back(DoneLabel + ":");
+      Values[&SI] = Dest;
     }
 
     void lowerReturn(const ReturnInst &RI) {
@@ -902,6 +1070,10 @@ class OS400MIEmitPass : public ModulePass {
             lowerBinaryOperator(*BO);
           } else if (const auto *ICI = dyn_cast<ICmpInst>(&I)) {
             lowerICmp(*ICI);
+          } else if (const auto *ZI = dyn_cast<ZExtInst>(&I)) {
+            lowerZExt(*ZI);
+          } else if (const auto *SI = dyn_cast<SelectInst>(&I)) {
+            lowerSelect(*SI);
           } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
             lowerStore(*SI);
           } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -916,8 +1088,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerConditionalBranch(*BI);
             SawTerminator = true;
           } else {
-            fail("i32 alloca/getelementptr/store/load/add/sub/icmp/phi, branch, and ret "
-                 "instructions");
+            fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/select/"
+                 "phi, branch, and ret instructions");
           }
         }
 

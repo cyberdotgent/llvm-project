@@ -20,6 +20,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -186,6 +187,8 @@ class OS400MIEmitPass : public ModulePass {
   struct ArenaSlot {
     std::string Name;
     uint32_t Offset = 0;
+    uint32_t Size = 0;
+    bool ScalarI32 = false;
   };
 
   struct CompareValue {
@@ -433,7 +436,20 @@ class OS400MIEmitPass : public ModulePass {
       auto It = Globals.find(GV);
       if (It == Globals.end() || It->second.Kind != "global" || Offset != 0)
         return std::nullopt;
-      return ArenaSlot{It->second.Name, It->second.Offset};
+      return ArenaSlot{It->second.Name, It->second.Offset, It->second.Size,
+                       It->second.Kind == "global"};
+    }
+
+    std::optional<ArenaSlot> getGlobalSlot(const Value *Ptr) const {
+      const auto *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts());
+      if (!GV)
+        return std::nullopt;
+
+      auto It = Globals.find(GV);
+      if (It == Globals.end())
+        return std::nullopt;
+      return ArenaSlot{It->second.Name, It->second.Offset, It->second.Size,
+                       It->second.Kind == "global"};
     }
 
     uint32_t getNextArenaOffset() const { return NextArenaOffset; }
@@ -454,10 +470,13 @@ class OS400MIEmitPass : public ModulePass {
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
     DenseMap<const BasicBlock *, std::string> BlockLabels;
+    DenseMap<const BasicBlock *, SmallVector<const PHINode *, 2>> BlockPHIs;
     SmallVector<std::string, 8> Declarations;
     SmallVector<std::string, 16> Body;
+    SmallVector<std::string, 16> EdgeBlocks;
     SmallVector<MapRecord, 16> MapRecords;
     uint32_t NextArenaOffset;
+    bool HasLoadStoreLens = false;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
 
@@ -499,6 +518,17 @@ class OS400MIEmitPass : public ModulePass {
       return It->second;
     }
 
+    void ensureLoadStoreLens() {
+      if (HasLoadStoreLens)
+        return;
+
+      HasLoadStoreLens = true;
+      Declarations.push_back("DCL     SPCPTR      .LS;");
+      Declarations.push_back("DCL     DD          OFF       BIN(4);");
+      Declarations.push_back("DCL     SPC         LOADSTORE BAS(.LS);");
+      Declarations.push_back("DCL     DD          LS_I4     BIN(4)     DIR        POS(1);");
+    }
+
     static StringRef getBranchPredicate(CmpInst::Predicate Predicate) {
       switch (Predicate) {
       case CmpInst::ICMP_EQ:
@@ -525,11 +555,25 @@ class OS400MIEmitPass : public ModulePass {
       if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
         APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
         if (!GEP->accumulateConstantOffset(DL, ConstantOffset))
-          fail("constant-offset global arena accesses");
+          return std::nullopt;
         Offset = ConstantOffset.getZExtValue();
         Base = GEP->getPointerOperand();
       }
       return Layout.getI32GlobalSlot(Base, Offset);
+    }
+
+    std::optional<uint32_t> getBaseArenaOffset(const Value *V) const {
+      if (const auto *AI = dyn_cast<AllocaInst>(V)) {
+        auto It = Slots.find(AI);
+        if (It == Slots.end())
+          return std::nullopt;
+        return It->second.Offset;
+      }
+
+      if (std::optional<ArenaSlot> Slot = Layout.getGlobalSlot(V))
+        return Slot->Offset;
+
+      return std::nullopt;
     }
 
     ArenaSlot getI32Slot(const Value *V) const {
@@ -543,6 +587,8 @@ class OS400MIEmitPass : public ModulePass {
       auto It = Slots.find(AI);
       if (It == Slots.end())
         fail("loads and stores through direct i32 allocas or globals");
+      if (!It->second.ScalarI32)
+        fail("direct loads and stores through scalar i32 allocas or globals");
       return It->second;
     }
 
@@ -553,23 +599,49 @@ class OS400MIEmitPass : public ModulePass {
       return Name;
     }
 
+    std::string createAnonymousTemp(StringRef Kind) {
+      std::string Name = Names.createTempName();
+      Declarations.push_back("DCL     DD          " + Name + "    BIN(4);");
+      addMapRecord(Name, Kind.str(), "", std::nullopt, 4, 4);
+      return Name;
+    }
+
     void lowerAlloca(const AllocaInst &AI) {
-      if (!isI32(AI.getAllocatedType()))
-        fail("i32 allocas");
       if (AI.isArrayAllocation())
-        fail("scalar i32 allocas");
+        fail("static scalar or i32-array allocas");
+
+      Type *AllocatedTy = AI.getAllocatedType();
+      bool ScalarI32 = isI32(AllocatedTy);
+      uint32_t Size = 0;
+      if (ScalarI32) {
+        Size = 4;
+      } else if (const auto *AT = dyn_cast<ArrayType>(AllocatedTy)) {
+        if (!AT->getElementType()->isIntegerTy(32))
+          fail("static scalar or i32-array allocas");
+        Size = AT->getNumElements() * 4;
+      } else {
+        fail("static scalar or i32-array allocas");
+      }
 
       uint32_t Offset = alignTo4(NextArenaOffset);
-      if (Offset + 4 > ArenaSize)
+      if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
-      ArenaSlot Slot{Names.createSlotName(), Offset};
-      NextArenaOffset = Offset + 4;
+      ArenaSlot Slot{Names.createSlotName(), Offset, Size, ScalarI32};
+      NextArenaOffset = Offset + Size;
       Slots[&AI] = Slot;
-      Declarations.push_back("DCL     DD          " + Slot.Name +
-                             "    BIN(4)     DEF(C_MEM) POS(" +
-                             std::to_string(Slot.Offset + 1) + ");");
-      addMapRecord(Slot.Name, "local", getOriginalName(AI), Slot.Offset, 4, 4);
+      if (ScalarI32) {
+        Declarations.push_back("DCL     DD          " + Slot.Name +
+                               "    BIN(4)     DEF(C_MEM) POS(" +
+                               std::to_string(Slot.Offset + 1) + ");");
+      } else {
+        Declarations.push_back("DCL     DD          " + Slot.Name +
+                               "    CHAR(" + std::to_string(Size) +
+                               ")    DEF(C_MEM) POS(" +
+                               std::to_string(Slot.Offset + 1) + ");");
+      }
+      addMapRecord(Slot.Name, "local", getOriginalName(AI), Slot.Offset, Size,
+                   4);
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
@@ -605,20 +677,141 @@ class OS400MIEmitPass : public ModulePass {
                            getOperandName(ICI.getOperand(1))};
     }
 
+    std::optional<std::string> tryGetPointerOffsetName(const Value *V) const {
+      if (std::optional<uint32_t> Offset = getBaseArenaOffset(V))
+        return std::to_string(*Offset);
+
+      auto It = Values.find(V);
+      if (It != Values.end())
+        return It->second;
+
+      if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+        const Value *Base = GEP->getPointerOperand();
+        APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
+        if (GEP->accumulateConstantOffset(DL, ConstantOffset)) {
+          if (std::optional<uint32_t> BaseOffset = getBaseArenaOffset(Base))
+            return std::to_string(*BaseOffset + ConstantOffset.getZExtValue());
+        }
+      }
+
+      return std::nullopt;
+    }
+
+    std::string getPointerOffsetName(const Value *V) const {
+      if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
+        return *Offset;
+      fail("arena PTR32 offsets from allocas, globals, or getelementptr");
+      llvm_unreachable("fail should not return");
+    }
+
+    void lowerGetElementPtr(const GetElementPtrInst &GEP) {
+      std::optional<uint32_t> BaseOffset =
+          getBaseArenaOffset(GEP.getPointerOperand());
+      if (!BaseOffset)
+        fail("getelementptr from arena allocas or globals");
+
+      APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
+      if (GEP.accumulateConstantOffset(DL, ConstantOffset)) {
+        Values[&GEP] =
+            std::to_string(*BaseOffset + ConstantOffset.getZExtValue());
+        return;
+      }
+
+      const Value *DynamicIndex = nullptr;
+      uint64_t DynamicScale = 0;
+      uint64_t StaticOffset = *BaseOffset;
+      for (gep_type_iterator GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP);
+           GTI != GTE; ++GTI) {
+        Value *Index = GTI.getOperand();
+        uint64_t Scale = DL.getTypeAllocSize(GTI.getIndexedType());
+        if (const auto *CI = dyn_cast<ConstantInt>(Index)) {
+          StaticOffset += CI->getZExtValue() * Scale;
+          continue;
+        }
+
+        if (DynamicIndex)
+          fail("getelementptr with one dynamic arena index");
+        if (!isI32(Index->getType()))
+          fail("i32 getelementptr indexes");
+        DynamicIndex = Index;
+        DynamicScale = Scale;
+      }
+
+      if (!DynamicIndex)
+        fail("constant getelementptr offsets");
+
+      std::string DynamicOffset = getOperandName(DynamicIndex);
+      if (DynamicScale == 4) {
+        std::string Twice = createAnonymousTemp("ptr_offset");
+        Body.push_back("        ADDN        " + Twice + "," + DynamicOffset +
+                       "," + DynamicOffset + ";");
+        std::string Quad = createAnonymousTemp("ptr_offset");
+        Body.push_back("        ADDN        " + Quad + "," + Twice + "," +
+                       Twice + ";");
+        DynamicOffset = Quad;
+      } else if (DynamicScale != 1) {
+        fail("dynamic getelementptr scale 1 or 4");
+      }
+
+      if (StaticOffset == 0) {
+        Values[&GEP] = DynamicOffset;
+        return;
+      }
+
+      std::string Dest = createTemp(GEP);
+      Body.push_back("        ADDN        " + Dest + "," + DynamicOffset + "," +
+                     std::to_string(StaticOffset) + ";");
+      Values[&GEP] = Dest;
+    }
+
     void lowerStore(const StoreInst &SI) {
       if (!isI32(SI.getValueOperand()->getType()))
         fail("i32 stores");
-      ArenaSlot Slot = getI32Slot(SI.getPointerOperand());
-      Body.push_back("        CPYNV       " + Slot.Name + "," +
+      if (std::optional<ArenaSlot> Slot =
+              getConstantI32GlobalSlot(SI.getPointerOperand())) {
+        Body.push_back("        CPYNV       " + Slot->Name + "," +
+                       getOperandName(SI.getValueOperand()) + ";");
+        return;
+      }
+
+      if (const auto *AI = dyn_cast<AllocaInst>(SI.getPointerOperand())) {
+        ArenaSlot Slot = getI32Slot(AI);
+        Body.push_back("        CPYNV       " + Slot.Name + "," +
+                       getOperandName(SI.getValueOperand()) + ";");
+        return;
+      }
+
+      ensureLoadStoreLens();
+      Body.push_back("        CPYNV       OFF," +
+                     getPointerOffsetName(SI.getPointerOperand()) + ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        CPYNV       LS_I4," +
                      getOperandName(SI.getValueOperand()) + ";");
     }
 
     void lowerLoad(const LoadInst &LI) {
       if (!isI32(LI.getType()))
         fail("i32 loads");
-      ArenaSlot Slot = getI32Slot(LI.getPointerOperand());
       std::string Dest = createTemp(LI);
-      Body.push_back("        CPYNV       " + Dest + "," + Slot.Name + ";");
+      if (std::optional<ArenaSlot> Slot =
+              getConstantI32GlobalSlot(LI.getPointerOperand())) {
+        Body.push_back("        CPYNV       " + Dest + "," + Slot->Name + ";");
+        Values[&LI] = Dest;
+        return;
+      }
+
+      if (const auto *AI = dyn_cast<AllocaInst>(LI.getPointerOperand())) {
+        ArenaSlot Slot = getI32Slot(AI);
+        Body.push_back("        CPYNV       " + Dest + "," + Slot.Name + ";");
+        Values[&LI] = Dest;
+        return;
+      }
+
+      ensureLoadStoreLens();
+      Body.push_back("        CPYNV       OFF," +
+                     getPointerOffsetName(LI.getPointerOperand()) + ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        CPYNV       " + Dest + ",LS_I4;");
       Values[&LI] = Dest;
     }
 
@@ -631,8 +824,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerUnconditionalBranch(const UncondBrInst &BI) {
-      Body.push_back("        B           " + getBlockLabel(BI.getSuccessor(0)) +
-                     ";");
+      Body.push_back("        B           " +
+                     getEdgeTarget(BI.getParent(), BI.getSuccessor(0)) + ";");
     }
 
     void lowerConditionalBranch(const CondBrInst &BI) {
@@ -644,10 +837,33 @@ class OS400MIEmitPass : public ModulePass {
       const CompareValue &Cmp = It->second;
       StringRef Predicate = getBranchPredicate(Cmp.Predicate);
       Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
-                     Predicate.str() + "(" + getBlockLabel(BI.getSuccessor(0)) +
-                     ");");
-      Body.push_back("        B           " + getBlockLabel(BI.getSuccessor(1)) +
+                     Predicate.str() + "(" +
+                     getEdgeTarget(BI.getParent(), BI.getSuccessor(0)) + ");");
+      Body.push_back("        B           " +
+                     getEdgeTarget(BI.getParent(), BI.getSuccessor(1)) +
                      ";");
+    }
+
+    bool hasPHIs(const BasicBlock *BB) const {
+      auto It = BlockPHIs.find(BB);
+      return It != BlockPHIs.end() && !It->second.empty();
+    }
+
+    std::string getEdgeTarget(const BasicBlock *Pred,
+                              const BasicBlock *Succ) {
+      if (!hasPHIs(Succ))
+        return getBlockLabel(Succ);
+
+      std::string EdgeLabel = Names.createBlockName();
+      addMapRecord(EdgeLabel, "edge_block");
+      EdgeBlocks.push_back(EdgeLabel + ":");
+      for (const PHINode *PN : BlockPHIs[Succ]) {
+        Value *Incoming = PN->getIncomingValueForBlock(Pred);
+        EdgeBlocks.push_back("        CPYNV       " + getOperandName(PN) + "," +
+                             getOperandName(Incoming) + ";");
+      }
+      EdgeBlocks.push_back("        B           " + getBlockLabel(Succ) + ";");
+      return EdgeLabel;
     }
 
   public:
@@ -656,25 +872,32 @@ class OS400MIEmitPass : public ModulePass {
           NextArenaOffset(Layout.getNextArenaOffset()) {}
 
     void lower(const Function &F) {
-      if (F.size() > 1) {
-        for (const BasicBlock &BB : F) {
-          std::string Label = Names.createBlockName();
-          addMapRecord(Label, "basic_block", getOriginalName(BB));
-          BlockLabels[&BB] = std::move(Label);
+      for (const BasicBlock &BB : F) {
+        std::string Label = Names.createBlockName();
+        addMapRecord(Label, "basic_block", getOriginalName(BB));
+        BlockLabels[&BB] = std::move(Label);
+        for (const PHINode &PN : BB.phis()) {
+          if (!isI32(PN.getType()))
+            fail("i32 phi nodes");
+          BlockPHIs[&BB].push_back(&PN);
+          Values[&PN] = createTemp(PN);
         }
       }
 
       for (const BasicBlock &BB : F) {
-        if (!BlockLabels.empty())
-          Body.push_back(getBlockLabel(&BB) + ":");
+        Body.push_back(getBlockLabel(&BB) + ":");
 
         bool SawTerminator = false;
         for (const Instruction &I : BB) {
           if (SawTerminator)
             fail("instructions before a single final terminator per block");
 
-          if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
+          if (isa<PHINode>(&I)) {
+            continue;
+          } else if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
             lowerAlloca(*AI);
+          } else if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+            lowerGetElementPtr(*GEP);
           } else if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
             lowerBinaryOperator(*BO);
           } else if (const auto *ICI = dyn_cast<ICmpInst>(&I)) {
@@ -693,7 +916,7 @@ class OS400MIEmitPass : public ModulePass {
             lowerConditionalBranch(*BI);
             SawTerminator = true;
           } else {
-            fail("i32 alloca/store/load/add/sub/icmp, branch, and ret "
+            fail("i32 alloca/getelementptr/store/load/add/sub/icmp/phi, branch, and ret "
                  "instructions");
           }
         }
@@ -701,6 +924,9 @@ class OS400MIEmitPass : public ModulePass {
         if (!SawTerminator)
           fail("each main block ending in ret or branch");
       }
+
+      for (const std::string &Line : EdgeBlocks)
+        Body.push_back(Line);
     }
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }

@@ -25,4 +25,5 @@ entry:
 ; MAP-NEXT: {"mi_name":"MAIN","kind":"function","original":"main"}
 ; MAP-NEXT: {"mi_name":"G000001","kind":"global","original":"g","arena_offset":4,"size":4,"alignment":4}
 ; MAP-NEXT: {"mi_name":"L000001","kind":"string","original":".str","arena_offset":8,"size":3,"alignment":1,"encoding":"ibm-037"}
+; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","original":"entry"}
 ; MAP-NEXT: {"mi_name":"T000001","kind":"temp","original":"v","size":4,"alignment":4}

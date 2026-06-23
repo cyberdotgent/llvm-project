@@ -274,11 +274,29 @@ class OS400MIEmitPass : public ModulePass {
     }
   };
 
+  enum class AccessWidth : uint8_t { I8 = 1, I16 = 2, I32 = 4 };
+
+  static AccessWidth getIntegerAccessWidth(Type *Ty) {
+    if (Ty->isIntegerTy(8))
+      return AccessWidth::I8;
+    if (Ty->isIntegerTy(16))
+      return AccessWidth::I16;
+    if (Ty->isIntegerTy(32))
+      return AccessWidth::I32;
+    fail("i8/i16/i32 arena accesses");
+    llvm_unreachable("fail should not return");
+  }
+
+  static uint32_t getAccessWidthBytes(AccessWidth Width) {
+    return static_cast<uint32_t>(Width);
+  }
+
   struct ArenaSlot {
     std::string Name;
     uint32_t Offset = 0;
     uint32_t Size = 0;
-    bool ScalarI32 = false;
+    AccessWidth Width = AccessWidth::I32;
+    bool DirectScalar = false;
   };
 
   struct CompareValue {
@@ -286,8 +304,6 @@ class OS400MIEmitPass : public ModulePass {
     std::string LHS;
     std::string RHS;
   };
-
-  enum class AccessWidth : uint8_t { I8 = 1, I16 = 2, I32 = 4 };
 
   struct MapRecord {
     std::string MIName;
@@ -373,6 +389,8 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Offset = 0;
       uint32_t Size = 0;
       uint32_t Alignment = 1;
+      AccessWidth Width = AccessWidth::I32;
+      bool DirectScalar = false;
     };
 
     NameAllocator Names;
@@ -527,30 +545,53 @@ class OS400MIEmitPass : public ModulePass {
 
     void addGlobalObject(const GlobalVariable &GV, const GeneratedName &Name,
                          std::string Kind, uint32_t Offset, uint32_t Size,
-                         uint32_t Alignment) {
-      Globals[&GV] = {Name.Name, Kind, Offset, Size, Alignment};
+                         uint32_t Alignment, AccessWidth Width,
+                         bool DirectScalar) {
+      Globals[&GV] = {Name.Name, Kind, Offset, Size, Alignment, Width,
+                      DirectScalar};
     }
 
-    void layoutI32Global(const GlobalVariable &GV) {
+    void layoutIntegerGlobal(const GlobalVariable &GV) {
       const auto *CI = dyn_cast<ConstantInt>(GV.getInitializer());
-      if (!CI || !CI->getType()->isIntegerTy(32))
-        fail("i32 globals with constant integer initializers");
+      if (!CI || !(CI->getType()->isIntegerTy(8) ||
+                   CI->getType()->isIntegerTy(16) ||
+                   CI->getType()->isIntegerTy(32)))
+        fail("i8/i16/i32 globals with constant integer initializers");
 
-      uint32_t Offset = alignTo(NextArenaOffset, 4);
-      if (Offset + 4 > ArenaSize)
+      AccessWidth Width = getIntegerAccessWidth(CI->getType());
+      uint32_t Size = getAccessWidthBytes(Width);
+      uint32_t Alignment = Width == AccessWidth::I8 ? 1 : Size;
+      uint32_t Offset = alignTo(NextArenaOffset, Alignment);
+      if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
       int32_t InitialValue = static_cast<int32_t>(CI->getSExtValue());
-      Declarations.push_back("DCL     DD          " + Name.Name +
-                             "    BIN(4)     DEF(C_MEM) POS(" +
-                             std::to_string(Offset + 1) + ") INIT(" +
-                             std::to_string(InitialValue) + ");");
-      addGlobalObject(GV, Name, "global", Offset, 4, 4);
-      addMapRecord(Name, "global", std::move(Original), Offset, 4, 4,
+      if (Width == AccessWidth::I8) {
+        std::string Hex;
+        raw_string_ostream HexOS(Hex);
+        HexOS << format_hex_no_prefix(CI->getZExtValue() & 0xFF, 2, true);
+        Declarations.push_back("DCL     DD          " + Name.Name +
+                               "    CHAR(1)    DEF(C_MEM) POS(" +
+                               std::to_string(Offset + 1) + ") INIT(X'" + Hex +
+                               "');");
+      } else if (Width == AccessWidth::I16) {
+        Declarations.push_back("DCL     DD          " + Name.Name +
+                               "    BIN(2)     UNSGND DEF(C_MEM) POS(" +
+                               std::to_string(Offset + 1) + ") INIT(" +
+                               std::to_string(CI->getZExtValue() & 0xFFFF) +
+                               ");");
+      } else {
+        Declarations.push_back("DCL     DD          " + Name.Name +
+                               "    BIN(4)     DEF(C_MEM) POS(" +
+                               std::to_string(Offset + 1) + ") INIT(" +
+                               std::to_string(InitialValue) + ");");
+      }
+      addGlobalObject(GV, Name, "global", Offset, Size, Alignment, Width, true);
+      addMapRecord(Name, "global", std::move(Original), Offset, Size, Alignment,
                    getSourceLocation(GV));
-      NextArenaOffset = Offset + 4;
+      NextArenaOffset = Offset + Size;
     }
 
     void layoutStringGlobal(const GlobalVariable &GV,
@@ -572,7 +613,8 @@ class OS400MIEmitPass : public ModulePass {
                              ")    DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(X'" + Hex +
                              "');");
-      addGlobalObject(GV, Name, "string", Offset, Size, 1);
+      addGlobalObject(GV, Name, "string", Offset, Size, 1, AccessWidth::I8,
+                      false);
       addMapRecord(Name, "string", std::move(Original), Offset, Size, 1,
                    getSourceLocation(GV), "ibm-037");
       NextArenaOffset = Offset + Size;
@@ -587,8 +629,9 @@ class OS400MIEmitPass : public ModulePass {
           fail("defined globals only");
 
         Type *ValueTy = GV.getValueType();
-        if (ValueTy->isIntegerTy(32)) {
-          layoutI32Global(GV);
+        if (ValueTy->isIntegerTy(8) || ValueTy->isIntegerTy(16) ||
+            ValueTy->isIntegerTy(32)) {
+          layoutIntegerGlobal(GV);
           continue;
         }
 
@@ -599,33 +642,21 @@ class OS400MIEmitPass : public ModulePass {
           continue;
         }
 
-        fail("i32 globals and constant i8 string globals");
+        fail("i8/i16/i32 globals and constant i8 string globals");
       }
     }
 
-    std::optional<ArenaSlot> getI32GlobalSlot(const Value *Ptr,
-                                              uint64_t Offset) const {
+    std::optional<ArenaSlot> getGlobalSlot(const Value *Ptr,
+                                           uint64_t Offset = 0) const {
       const auto *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts());
       if (!GV)
         return std::nullopt;
 
       auto It = Globals.find(GV);
-      if (It == Globals.end() || It->second.Kind != "global" || Offset != 0)
+      if (It == Globals.end() || Offset >= It->second.Size)
         return std::nullopt;
       return ArenaSlot{It->second.Name, It->second.Offset, It->second.Size,
-                       It->second.Kind == "global"};
-    }
-
-    std::optional<ArenaSlot> getGlobalSlot(const Value *Ptr) const {
-      const auto *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts());
-      if (!GV)
-        return std::nullopt;
-
-      auto It = Globals.find(GV);
-      if (It == Globals.end())
-        return std::nullopt;
-      return ArenaSlot{It->second.Name, It->second.Offset, It->second.Size,
-                       It->second.Kind == "global"};
+                       It->second.Width, It->second.DirectScalar && Offset == 0};
     }
 
     uint32_t getNextArenaOffset() const { return NextArenaOffset; }
@@ -763,7 +794,7 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
 
-    std::optional<ArenaSlot> getConstantI32GlobalSlot(const Value *V) const {
+    std::optional<ArenaSlot> getConstantGlobalSlot(const Value *V) const {
       const Value *Base = V;
       uint64_t Offset = 0;
       if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
@@ -773,7 +804,7 @@ class OS400MIEmitPass : public ModulePass {
         Offset = ConstantOffset.getZExtValue();
         Base = GEP->getPointerOperand();
       }
-      return Layout.getI32GlobalSlot(Base, Offset);
+      return Layout.getGlobalSlot(Base, Offset);
     }
 
     std::optional<uint32_t> getBaseArenaOffset(const Value *V) const {
@@ -790,19 +821,22 @@ class OS400MIEmitPass : public ModulePass {
       return std::nullopt;
     }
 
-    ArenaSlot getI32Slot(const Value *V) const {
-      const auto *AI = dyn_cast<AllocaInst>(V);
-      if (!AI) {
-        if (std::optional<ArenaSlot> Slot = getConstantI32GlobalSlot(V))
-          return *Slot;
-        fail("loads and stores through direct i32 allocas or globals");
+    std::optional<ArenaSlot> getDirectScalarSlot(const Value *V) const {
+      if (std::optional<ArenaSlot> Slot = getConstantGlobalSlot(V)) {
+        if (Slot->DirectScalar)
+          return Slot;
+        return std::nullopt;
       }
+
+      const auto *AI = dyn_cast<AllocaInst>(V);
+      if (!AI)
+        return std::nullopt;
 
       auto It = Slots.find(AI);
       if (It == Slots.end())
-        fail("loads and stores through direct i32 allocas or globals");
-      if (!It->second.ScalarI32)
-        fail("direct loads and stores through scalar i32 allocas or globals");
+        return std::nullopt;
+      if (!It->second.DirectScalar)
+        return std::nullopt;
       return It->second;
     }
 
@@ -832,10 +866,12 @@ class OS400MIEmitPass : public ModulePass {
         fail("static scalar or i32-array allocas");
 
       Type *AllocatedTy = AI.getAllocatedType();
-      bool ScalarI32 = isI32(AllocatedTy);
+      bool ScalarInt = isSupportedInt(AllocatedTy);
+      AccessWidth Width =
+          ScalarInt ? getIntegerAccessWidth(AllocatedTy) : AccessWidth::I8;
       uint32_t Size = 0;
-      if (ScalarI32) {
-        Size = 4;
+      if (ScalarInt) {
+        Size = getAccessWidthBytes(Width);
       } else if (const auto *AT = dyn_cast<ArrayType>(AllocatedTy)) {
         Type *EltTy = AT->getElementType();
         if (!isSupportedInt(EltTy))
@@ -851,12 +887,16 @@ class OS400MIEmitPass : public ModulePass {
 
       std::string Original = getOriginalName(AI);
       GeneratedName SlotName = Names.createSlotName(Original);
-      ArenaSlot Slot{SlotName.Name, Offset, Size, ScalarI32};
+      ArenaSlot Slot{SlotName.Name, Offset, Size, Width, ScalarInt};
       NextArenaOffset = Offset + Size;
       Slots[&AI] = Slot;
-      if (ScalarI32) {
+      if (ScalarInt && Width == AccessWidth::I32) {
         Declarations.push_back("DCL     DD          " + Slot.Name +
                                "    BIN(4)     DEF(C_MEM) POS(" +
+                               std::to_string(Slot.Offset + 1) + ");");
+      } else if (ScalarInt && Width == AccessWidth::I16) {
+        Declarations.push_back("DCL     DD          " + Slot.Name +
+                               "    BIN(2)     UNSGND DEF(C_MEM) POS(" +
                                std::to_string(Slot.Offset + 1) + ");");
       } else {
         Declarations.push_back("DCL     DD          " + Slot.Name +
@@ -959,22 +999,38 @@ class OS400MIEmitPass : public ModulePass {
       llvm_unreachable("fail should not return");
     }
 
+    std::string addStaticOffset(const Twine &Kind, StringRef Base,
+                                uint64_t Offset) {
+      if (Offset == 0)
+        return Base.str();
+
+      uint64_t BaseValue = 0;
+      if (!Base.getAsInteger(10, BaseValue))
+        return std::to_string(BaseValue + Offset);
+
+      std::string Dest = createAnonymousTemp(Kind.str());
+      Body.push_back("        ADDN        " + Dest + "," + Base.str() + "," +
+                     std::to_string(Offset) + ";");
+      return Dest;
+    }
+
     void lowerGetElementPtr(const GetElementPtrInst &GEP) {
-      std::optional<uint32_t> BaseOffset =
-          getBaseArenaOffset(GEP.getPointerOperand());
+      std::optional<std::string> BaseOffset =
+          tryGetPointerOffsetName(GEP.getPointerOperand());
       if (!BaseOffset)
-        fail("getelementptr from arena allocas or globals");
+        fail("getelementptr from arena allocas, globals, or pointer offsets");
 
       APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
       if (GEP.accumulateConstantOffset(DL, ConstantOffset)) {
         Values[&GEP] =
-            std::to_string(*BaseOffset + ConstantOffset.getZExtValue());
+            addStaticOffset("ptr_offset", *BaseOffset,
+                            ConstantOffset.getZExtValue());
         return;
       }
 
       const Value *DynamicIndex = nullptr;
       uint64_t DynamicScale = 0;
-      uint64_t StaticOffset = *BaseOffset;
+      uint64_t StaticOffset = 0;
       for (gep_type_iterator GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP);
            GTI != GTE; ++GTI) {
         Value *Index = GTI.getOperand();
@@ -1013,26 +1069,34 @@ class OS400MIEmitPass : public ModulePass {
         fail("dynamic getelementptr scale 1, 2, or 4");
       }
 
-      if (StaticOffset == 0) {
-        Values[&GEP] = DynamicOffset;
+      std::string Offset =
+          addStaticOffset("ptr_offset", DynamicOffset, StaticOffset);
+
+      uint64_t BaseValue = 0;
+      if (!StringRef(*BaseOffset).getAsInteger(10, BaseValue) &&
+          BaseValue == 0) {
+        Values[&GEP] = Offset;
+        return;
+      }
+
+      uint64_t OffsetValue = 0;
+      if (!StringRef(Offset).getAsInteger(10, OffsetValue) && OffsetValue == 0) {
+        Values[&GEP] = *BaseOffset;
         return;
       }
 
       std::string Dest = createTemp(GEP);
-      Body.push_back("        ADDN        " + Dest + "," + DynamicOffset + "," +
-                     std::to_string(StaticOffset) + ";");
+      if (!StringRef(*BaseOffset).getAsInteger(10, BaseValue))
+        Body.push_back("        ADDN        " + Dest + "," + Offset + "," +
+                       *BaseOffset + ";");
+      else
+        Body.push_back("        ADDN        " + Dest + "," + *BaseOffset + "," +
+                       Offset + ";");
       Values[&GEP] = Dest;
     }
 
     AccessWidth getAccessWidth(Type *Ty) const {
-      if (Ty->isIntegerTy(8))
-        return AccessWidth::I8;
-      if (Ty->isIntegerTy(16))
-        return AccessWidth::I16;
-      if (Ty->isIntegerTy(32))
-        return AccessWidth::I32;
-      fail("i8/i16/i32 arena accesses");
-      llvm_unreachable("fail should not return");
+      return getIntegerAccessWidth(Ty);
     }
 
     static StringRef getLensName(AccessWidth Width) {
@@ -1045,6 +1109,48 @@ class OS400MIEmitPass : public ModulePass {
         return "LS_I4";
       }
       llvm_unreachable("unknown access width");
+    }
+
+    void emitLoadFromReference(StringRef Dest, StringRef Ref,
+                               AccessWidth Width) {
+      if (Width == AccessWidth::I8) {
+        ensureU1Box();
+        Body.push_back("        CPYBLA      U1_BOX,X'00000000';");
+        Body.push_back("        CPYBLA      U1_BYTE," + Ref.str() + ";");
+        Body.push_back("        CPYNV       " + Dest.str() + ",U1_NUM;");
+        return;
+      }
+
+      Body.push_back("        CPYNV       " + Dest.str() + "," + Ref.str() +
+                     ";");
+    }
+
+    void emitStoreToReference(StringRef Ref, AccessWidth Width,
+                              const Value *Value) {
+      if (Width == AccessWidth::I8) {
+        if (const auto *CI = dyn_cast<ConstantInt>(Value)) {
+          Body.push_back("        CPYBLA      " + Ref.str() + ",X'" +
+                         getByteHex(*CI) + "';");
+          return;
+        }
+
+        ensureU1Box();
+        Body.push_back("        CPYNV       U1_NUM," + getOperandName(Value) +
+                       ";");
+        Body.push_back("        CPYBLA      " + Ref.str() + ",U1_BYTE;");
+        return;
+      }
+
+      if (Width == AccessWidth::I16) {
+        if (const auto *CI = dyn_cast<ConstantInt>(Value)) {
+          Body.push_back("        CPYNV       " + Ref.str() + "," +
+                         std::to_string(CI->getZExtValue() & 0xFFFF) + ";");
+          return;
+        }
+      }
+
+      Body.push_back("        CPYNV       " + Ref.str() + "," +
+                     getOperandName(Value) + ";");
     }
 
     void emitSetLensPointer(const Value *Ptr) {
@@ -1066,74 +1172,33 @@ class OS400MIEmitPass : public ModulePass {
     void lowerStore(const StoreInst &SI) {
       Type *ValueTy = SI.getValueOperand()->getType();
       AccessWidth Width = getAccessWidth(ValueTy);
-      if (Width != AccessWidth::I32 &&
-          dyn_cast<AllocaInst>(SI.getPointerOperand()))
-        fail("direct i8/i16 stores require dynamic arena lenses");
-
       if (std::optional<ArenaSlot> Slot =
-              getConstantI32GlobalSlot(SI.getPointerOperand())) {
-        Body.push_back("        CPYNV       " + Slot->Name + "," +
-                       getOperandName(SI.getValueOperand()) + ";");
-        return;
-      }
-
-      if (const auto *AI = dyn_cast<AllocaInst>(SI.getPointerOperand())) {
-        ArenaSlot Slot = getI32Slot(AI);
-        Body.push_back("        CPYNV       " + Slot.Name + "," +
-                       getOperandName(SI.getValueOperand()) + ";");
+              getDirectScalarSlot(SI.getPointerOperand())) {
+        if (Slot->Width != Width)
+          fail("stores matching direct scalar slot width");
+        emitStoreToReference(Slot->Name, Width, SI.getValueOperand());
         return;
       }
 
       emitSetLensPointer(SI.getPointerOperand());
-      if (Width == AccessWidth::I8) {
-        if (const auto *CI = dyn_cast<ConstantInt>(SI.getValueOperand())) {
-          Body.push_back("        CPYBLA      LS_I1,X'" + getByteHex(*CI) +
-                         "';");
-          return;
-        }
-
-        ensureU1Box();
-        Body.push_back("        CPYNV       U1_NUM," +
-                       getOperandName(SI.getValueOperand()) + ";");
-        Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
-        return;
-      }
-
-      Body.push_back("        CPYNV       " + getLensName(Width).str() + "," +
-                     getOperandName(SI.getValueOperand()) + ";");
+      emitStoreToReference(getLensName(Width), Width, SI.getValueOperand());
     }
 
     void lowerLoad(const LoadInst &LI) {
       AccessWidth Width = getAccessWidth(LI.getType());
-      if (Width != AccessWidth::I32 &&
-          dyn_cast<AllocaInst>(LI.getPointerOperand()))
-        fail("direct i8/i16 loads require dynamic arena lenses");
 
       std::string Dest = createTemp(LI);
       if (std::optional<ArenaSlot> Slot =
-              getConstantI32GlobalSlot(LI.getPointerOperand())) {
-        Body.push_back("        CPYNV       " + Dest + "," + Slot->Name + ";");
-        Values[&LI] = Dest;
-        return;
-      }
-
-      if (const auto *AI = dyn_cast<AllocaInst>(LI.getPointerOperand())) {
-        ArenaSlot Slot = getI32Slot(AI);
-        Body.push_back("        CPYNV       " + Dest + "," + Slot.Name + ";");
+              getDirectScalarSlot(LI.getPointerOperand())) {
+        if (Slot->Width != Width)
+          fail("loads matching direct scalar slot width");
+        emitLoadFromReference(Dest, Slot->Name, Width);
         Values[&LI] = Dest;
         return;
       }
 
       emitSetLensPointer(LI.getPointerOperand());
-      if (Width == AccessWidth::I8) {
-        ensureU1Box();
-        Body.push_back("        CPYBLA      U1_BOX,X'00000000';");
-        Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
-        Body.push_back("        CPYNV       " + Dest + ",U1_NUM;");
-      } else {
-        Body.push_back("        CPYNV       " + Dest + "," +
-                       getLensName(Width).str() + ";");
-      }
+      emitLoadFromReference(Dest, getLensName(Width), Width);
       Values[&LI] = Dest;
     }
 
@@ -1150,6 +1215,34 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       Values[&ZI] = getOperandName(ZI.getOperand(0));
+    }
+
+    void lowerSExt(const SExtInst &SI) {
+      Type *SrcTy = SI.getOperand(0)->getType();
+      if (!SI.getType()->isIntegerTy(32) ||
+          !(SrcTy->isIntegerTy(8) || SrcTy->isIntegerTy(16)))
+        fail("sext from i8/i16 to i32");
+
+      if (const auto *CI = dyn_cast<ConstantInt>(SI.getOperand(0))) {
+        Values[&SI] = std::to_string(static_cast<int32_t>(CI->getSExtValue()));
+        return;
+      }
+
+      std::string Src = getOperandName(SI.getOperand(0));
+      std::string Dest = createTemp(SI);
+      GeneratedName DoneName = Names.createBlockName();
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(DoneName, "sext_done", "", getSourceLocation(SI));
+
+      uint32_t SignLimit = SrcTy->isIntegerTy(8) ? 127 : 32767;
+      uint32_t Modulus = SrcTy->isIntegerTy(8) ? 256 : 65536;
+      Body.push_back("        CPYNV       " + Dest + "," + Src + ";");
+      Body.push_back("        CMPNV(B)    " + Src + "," +
+                     std::to_string(SignLimit) + "/NHI(" + DoneLabel + ");");
+      Body.push_back("        SUBN        " + Dest + "," + Src + "," +
+                     std::to_string(Modulus) + ";");
+      Body.push_back(DoneLabel + ":");
+      Values[&SI] = Dest;
     }
 
     void lowerSelect(const SelectInst &SI) {
@@ -1278,6 +1371,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerICmp(*ICI);
           } else if (const auto *ZI = dyn_cast<ZExtInst>(&I)) {
             lowerZExt(*ZI);
+          } else if (const auto *SI = dyn_cast<SExtInst>(&I)) {
+            lowerSExt(*SI);
           } else if (const auto *SI = dyn_cast<SelectInst>(&I)) {
             lowerSelect(*SI);
           } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -1294,7 +1389,7 @@ class OS400MIEmitPass : public ModulePass {
             lowerConditionalBranch(*BI);
             SawTerminator = true;
           } else {
-            fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/select/"
+            fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/sext/select/"
                  "phi, branch, and ret instructions");
           }
         }

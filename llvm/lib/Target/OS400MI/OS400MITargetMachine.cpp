@@ -394,6 +394,37 @@ class OS400MIEmitPass : public ModulePass {
     return isSupportedArenaAggregateType(Ty);
   }
 
+  static bool isAggregateABIValueType(Type *Ty) {
+    return Ty && !(Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+                   Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+                   Ty->isIntegerTy(64) || Ty->isPointerTy()) &&
+           isSupportedArenaValueType(Ty);
+  }
+
+  static std::optional<bool>
+  getAggregateComparePseudoKind(const Function *F) {
+    if (!F)
+      return std::nullopt;
+
+    StringRef Name = F->getName();
+    std::optional<bool> IsEqual;
+    if (Name.starts_with("llvm.os400mi.aggregate.eq"))
+      IsEqual = true;
+    else if (Name.starts_with("llvm.os400mi.aggregate.ne"))
+      IsEqual = false;
+    else
+      return std::nullopt;
+
+    FunctionType *Ty = F->getFunctionType();
+    if (!F->isDeclaration() || !Ty->getReturnType()->isIntegerTy(1) ||
+        Ty->getNumParams() != 2 || Ty->getParamType(0) != Ty->getParamType(1) ||
+        !isAggregateABIValueType(Ty->getParamType(0)))
+      fail("OS400MI aggregate equality pseudo calls with two matching "
+           "supported aggregate operands");
+
+    return IsEqual;
+  }
+
   struct CompareValue {
     CmpInst::Predicate Predicate;
     std::string LHS;
@@ -1229,7 +1260,7 @@ class OS400MIEmitPass : public ModulePass {
       for (const BasicBlock &BB : F) {
         for (const Instruction &I : BB) {
           const auto *CB = dyn_cast<CallBase>(&I);
-          if (!CB || isa<IntrinsicInst>(I))
+          if (!CB)
             continue;
 
           if (CB->isIndirectCall())
@@ -1239,6 +1270,10 @@ class OS400MIEmitPass : public ModulePass {
           const Function *Callee = CB->getCalledFunction();
           if (!Callee)
             fail("direct function calls");
+          if (getAggregateComparePseudoKind(Callee))
+            continue;
+          if (isa<IntrinsicInst>(I))
+            continue;
           if (Callee->isDeclaration())
             fail("defined internal callees; external calls require CALLX ABI");
 
@@ -1325,10 +1360,7 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     static bool isAggregateABIType(Type *Ty) {
-      return Ty && !(Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
-                     Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
-                     Ty->isIntegerTy(64) || Ty->isPointerTy()) &&
-             isSupportedArenaValueType(Ty);
+      return isAggregateABIValueType(Ty);
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
@@ -2910,6 +2942,70 @@ class OS400MIEmitPass : public ModulePass {
       fail("aggregate call values from constants, loads, or insertvalue");
     }
 
+    ArenaSlot materializeAggregateSlot(const Value *V, StringRef Kind) {
+      if (!isAggregateABIType(V->getType()))
+        fail("aggregate values");
+
+      if (auto It = AggregateValues.find(V); It != AggregateValues.end())
+        return It->second;
+
+      if (std::optional<SmallVector<uint8_t, 32>> Bytes =
+              getConstantStoreBytes(V)) {
+        ArenaSlot Slot = createAggregateTemp(*V, V->getType(), Kind);
+        for (uint64_t I = 0, E = Bytes->size(); I != E; ++I)
+          emitStoreByteToPointer(std::to_string(Slot.Offset), I, (*Bytes)[I]);
+        AggregateValues[V] = Slot;
+        return Slot;
+      }
+
+      fail("aggregate values from constants, loads, calls, arguments, or "
+           "insertvalue");
+      llvm_unreachable("fail should not return");
+    }
+
+    void lowerAggregateCompareCall(const CallBase &CB, bool IsEqual) {
+      if (CB.arg_size() != 2 ||
+          CB.getArgOperand(0)->getType() != CB.getArgOperand(1)->getType())
+        fail("OS400MI aggregate compare operands with matching types");
+
+      ArenaSlot LHS =
+          materializeAggregateSlot(CB.getArgOperand(0), "aggregate_compare_lhs");
+      ArenaSlot RHS =
+          materializeAggregateSlot(CB.getArgOperand(1), "aggregate_compare_rhs");
+      if (LHS.Size != RHS.Size)
+        fail("OS400MI aggregate compare operands with matching layout size");
+
+      std::string Dest = createTemp(CB);
+      GeneratedName HitName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string HitLabel = HitName.Name;
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(HitName,
+                   IsEqual ? "aggregate_compare_false"
+                           : "aggregate_compare_true",
+                   "", getSourceLocation(CB));
+      addMapRecord(DoneName, "aggregate_compare_done", "",
+                   getSourceLocation(CB));
+
+      Body.push_back("        CPYNV       " + Dest + (IsEqual ? ",1;" : ",0;"));
+      for (uint32_t I = 0; I != LHS.Size; ++I) {
+        std::string LByte = createAnonymousTemp("aggregate_compare_byte");
+        std::string RByte = createAnonymousTemp("aggregate_compare_byte");
+        emitSetLensPointerFromOffset(std::to_string(LHS.Offset + I));
+        emitLoadFromReference(LByte, "LS_I1", AccessWidth::I8);
+        emitSetLensPointerFromOffset(std::to_string(RHS.Offset + I));
+        emitLoadFromReference(RByte, "LS_I1", AccessWidth::I8);
+        Body.push_back("        CMPNV(B)    " + LByte + "," + RByte +
+                       "/NEQ(" + HitLabel + ");");
+      }
+
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(HitLabel + ":");
+      Body.push_back("        CPYNV       " + Dest + (IsEqual ? ",0;" : ",1;"));
+      Body.push_back(DoneLabel + ":");
+      Values[&CB] = Dest;
+    }
+
     void emitStoreByteToPointer(StringRef PtrOffset, uint64_t ByteOffset,
                                 uint8_t Byte) {
       emitSetLensPointerFromOffset(getPointerOffsetPlus(PtrOffset, ByteOffset));
@@ -3404,13 +3500,20 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerCall(const CallBase &CB) {
-      if (isa<IntrinsicInst>(CB))
-        fail("supported LLVM intrinsics");
       if (CB.isIndirectCall())
         fail("direct function calls; indirect calls require a function pointer "
              "ABI");
 
       const Function *Callee = CB.getCalledFunction();
+      if (std::optional<bool> IsAggregateCompare =
+              getAggregateComparePseudoKind(Callee)) {
+        lowerAggregateCompareCall(CB, *IsAggregateCompare);
+        return;
+      }
+
+      if (isa<IntrinsicInst>(CB))
+        fail("supported LLVM intrinsics");
+
       if (!Callee || Callee->isDeclaration())
         fail("defined internal callees; external calls require CALLX ABI");
 

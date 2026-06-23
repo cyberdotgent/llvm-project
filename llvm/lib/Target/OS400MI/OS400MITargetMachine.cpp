@@ -692,6 +692,11 @@ class OS400MIEmitPass : public ModulePass {
                     Ty->isIntegerTy(32));
     }
 
+    static bool isSupportedCompareInt(Type *Ty) {
+      return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
+                    Ty->isIntegerTy(32));
+    }
+
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
 
     static std::string getOriginalName(const Value &V) {
@@ -727,8 +732,10 @@ class OS400MIEmitPass : public ModulePass {
 
     std::string getOperandName(const Value *V) const {
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
-        if (!isSupportedInt(CI->getType()))
-          fail("i8/i16/i32 constants in lowered expressions");
+        if (!CI->getType()->isIntegerTy(1) && !isSupportedInt(CI->getType()))
+          fail("i1/i8/i16/i32 constants in lowered expressions");
+        if (CI->getType()->isIntegerTy(1))
+          return CI->isOne() ? "1" : "0";
         return std::to_string(static_cast<int32_t>(CI->getSExtValue()));
       }
 
@@ -736,6 +743,17 @@ class OS400MIEmitPass : public ModulePass {
       if (It == Values.end())
         fail("operands defined by previous supported i32 instructions");
       return It->second;
+    }
+
+    std::string getCompareOperandName(const Value *V) const {
+      if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+        Type *Ty = CI->getType();
+        if (Ty->isIntegerTy(8))
+          return std::to_string(CI->getZExtValue() & 0xFF);
+        if (Ty->isIntegerTy(16))
+          return std::to_string(CI->getZExtValue() & 0xFFFF);
+      }
+      return getOperandName(V);
     }
 
     std::string getBlockLabel(const BasicBlock *BB) const {
@@ -933,12 +951,59 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerICmp(const ICmpInst &ICI) {
-      if (!isI32(ICI.getOperand(0)->getType()) ||
-          !isI32(ICI.getOperand(1)->getType()))
-        fail("i32 icmp expressions");
+      if (!isSupportedCompareInt(ICI.getOperand(0)->getType()) ||
+          ICI.getOperand(0)->getType() != ICI.getOperand(1)->getType())
+        fail("i8/i16/i32 icmp expressions");
+      if (!ICI.getOperand(0)->getType()->isIntegerTy(32) && ICI.isSigned())
+        fail("signed i8/i16 icmp expressions after sext to i32");
 
-      Comparisons[&ICI] = {ICI.getPredicate(), getOperandName(ICI.getOperand(0)),
-                           getOperandName(ICI.getOperand(1))};
+      Comparisons[&ICI] = {ICI.getPredicate(),
+                           getCompareOperandName(ICI.getOperand(0)),
+                           getCompareOperandName(ICI.getOperand(1))};
+    }
+
+    std::string materializeBoolean(const Value *V) {
+      if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+        if (!CI->getType()->isIntegerTy(1))
+          fail("i1 boolean constants");
+        return CI->isOne() ? "1" : "0";
+      }
+
+      if (const auto *ICI = dyn_cast<ICmpInst>(V))
+        return materializeCompare(*ICI);
+
+      auto It = Values.find(V);
+      if (It == Values.end())
+        fail("supported i1 boolean values");
+      return It->second;
+    }
+
+    void emitBranchOnCondition(const Value *Cond, StringRef TrueLabel) {
+      if (const auto *CI = dyn_cast<ConstantInt>(Cond)) {
+        if (!CI->getType()->isIntegerTy(1))
+          fail("i1 branch conditions");
+        if (CI->isOne())
+          Body.push_back("        B           " + TrueLabel.str() + ";");
+        return;
+      }
+
+      if (auto It = Comparisons.find(Cond); It != Comparisons.end()) {
+        const CompareValue &Cmp = It->second;
+        Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
+                       getBranchPredicate(Cmp.Predicate).str() + "(" +
+                       TrueLabel.str() + ");");
+        return;
+      }
+
+      if (const auto *ICI = dyn_cast<ICmpInst>(Cond)) {
+        lowerICmp(*ICI);
+        emitBranchOnCondition(Cond, TrueLabel);
+        return;
+      }
+
+      std::string Bool = materializeBoolean(Cond);
+      Body.push_back("        CMPNV(B)    " + Bool + ",0/NEQ(" +
+                     TrueLabel.str() + ");");
     }
 
     std::string materializeCompare(const ICmpInst &ICI) {
@@ -1246,18 +1311,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerSelect(const SelectInst &SI) {
-      if (!isI32(SI.getType()))
-        fail("i32 select values");
-      const auto *ICI = dyn_cast<ICmpInst>(SI.getCondition());
-      if (!ICI)
-        fail("select directly from an i32 icmp");
-      auto It = Comparisons.find(ICI);
-      if (It == Comparisons.end()) {
-        lowerICmp(*ICI);
-        It = Comparisons.find(ICI);
-      }
-
-      const CompareValue &Cmp = It->second;
+      if (!SI.getType()->isIntegerTy(1) && !isI32(SI.getType()))
+        fail("i1/i32 select values");
       std::string Dest = createTemp(SI);
       GeneratedName TrueName = Names.createBlockName();
       GeneratedName DoneName = Names.createBlockName();
@@ -1267,9 +1322,7 @@ class OS400MIEmitPass : public ModulePass {
       addMapRecord(DoneName, "select_done", "", getSourceLocation(SI));
       Body.push_back("        CPYNV       " + Dest + "," +
                      getOperandName(SI.getFalseValue()) + ";");
-      Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
-                     getBranchPredicate(Cmp.Predicate).str() + "(" +
-                     TrueLabel + ");");
+      emitBranchOnCondition(SI.getCondition(), TrueLabel);
       Body.push_back("        B           " + DoneLabel + ";");
       Body.push_back(TrueLabel + ":");
       Body.push_back("        CPYNV       " + Dest + "," +
@@ -1292,16 +1345,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerConditionalBranch(const CondBrInst &BI) {
-      const Value *Cond = BI.getCondition();
-      auto It = Comparisons.find(Cond);
-      if (It == Comparisons.end())
-        fail("conditional branches directly from an i32 icmp");
-
-      const CompareValue &Cmp = It->second;
-      StringRef Predicate = getBranchPredicate(Cmp.Predicate);
-      Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
-                     Predicate.str() + "(" +
-                     getEdgeTarget(BI.getParent(), BI.getSuccessor(0)) + ");");
+      emitBranchOnCondition(
+          BI.getCondition(), getEdgeTarget(BI.getParent(), BI.getSuccessor(0)));
       Body.push_back("        B           " +
                      getEdgeTarget(BI.getParent(), BI.getSuccessor(1)) +
                      ";");
@@ -1344,8 +1389,8 @@ class OS400MIEmitPass : public ModulePass {
                      getSourceLocation(BB));
         BlockLabels[&BB] = Label.Name;
         for (const PHINode &PN : BB.phis()) {
-          if (!isI32(PN.getType()))
-            fail("i32 phi nodes");
+          if (!PN.getType()->isIntegerTy(1) && !isI32(PN.getType()))
+            fail("i1/i32 phi nodes");
           BlockPHIs[&BB].push_back(&PN);
           Values[&PN] = createTemp(PN);
         }

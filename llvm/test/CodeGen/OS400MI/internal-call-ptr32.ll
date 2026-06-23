@@ -48,7 +48,7 @@ entry:
 ; MAP-SAME: "original":"main"
 ; MAP-SAME: "arena_offset":4
 ; MAP-SAME: "size":4
-; MAP-SAME: "encoding":"static-arena"
+; MAP-SAME: "encoding":"static-arena;activation=per-function;reentrant=false;recursion=unsupported;future=software-stack"
 ; MAP: "mi_name":"F000001_FRAME"
 ; MAP-SAME: "kind":"frame"
 ; MAP-SAME: "original":"idp"

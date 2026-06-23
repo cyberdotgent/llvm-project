@@ -1306,6 +1306,7 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<std::string, 16> EdgeBlocks;
     SmallVector<MapRecord, 16> MapRecords;
     uint32_t NextArenaOffset;
+    uint32_t NextCallBarrier = 1;
     bool HasLoadStoreLens = false;
     bool HasU1Box = false;
 
@@ -1387,7 +1388,40 @@ class OS400MIEmitPass : public ModulePass {
                             FrameOffset,
                             FrameSize,
                             4,
-                            "static-arena"});
+                            "static-arena;activation=per-function;"
+                            "reentrant=false;recursion=unsupported;"
+                            "future=software-stack"});
+    }
+
+    void addCallAliasBarrierRecord(const CallBase &CB,
+                                   const FunctionInfo &CalleeInfo) {
+      std::string Name =
+          CurrentFunction->EntryName + "_CALLB" + std::to_string(NextCallBarrier++);
+      if (Name.size() > NameAllocator::getMaxMINameLength())
+        fail("call alias barrier map names no longer than 48 characters");
+      MapRecords.push_back({std::move(Name),
+                            "call_alias_barrier",
+                            "call_barrier",
+                            CalleeInfo.F ? getOriginalName(*CalleeInfo.F) : "",
+                            std::nullopt,
+                            std::nullopt,
+                            false,
+                            NameAllocator::getMaxMINameLength(),
+                            "",
+                            getSourceLocation(cast<Instruction>(CB)),
+                            std::nullopt,
+                            std::nullopt,
+                            std::nullopt,
+                            "arena-memory;invalidate=promoted-scalars;"
+                            "scope=conservative"});
+    }
+
+    void invalidateCallAliasedMemory(const CallBase &CB,
+                                     const FunctionInfo &CalleeInfo) {
+      // Loads are always emitted as loads today, so there are no live promoted
+      // memory values to discard yet. Keep this as the single hook future
+      // promotion caches must clear when a callee may touch arena memory.
+      addCallAliasBarrierRecord(CB, CalleeInfo);
     }
 
     std::string getOperandName(const Value *V) const {
@@ -3411,6 +3445,7 @@ class OS400MIEmitPass : public ModulePass {
         maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
       }
 
+      invalidateCallAliasedMemory(CB, CalleeInfo);
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
       if (CB.getType()->isIntegerTy(64)) {

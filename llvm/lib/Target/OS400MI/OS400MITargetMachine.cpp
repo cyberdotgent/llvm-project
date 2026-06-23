@@ -111,8 +111,6 @@ class OS400MIEmitPass : public ModulePass {
 
     if (Main->empty())
       fail("a defined i32 main function");
-    if (Main->size() != 1)
-      fail("main with one basic block");
 
     return *Main;
   }
@@ -120,6 +118,7 @@ class OS400MIEmitPass : public ModulePass {
   class NameAllocator {
     unsigned NextSlot = 1;
     unsigned NextTemp = 1;
+    unsigned NextBlock = 1;
 
   public:
     std::string createSlotName() {
@@ -129,6 +128,10 @@ class OS400MIEmitPass : public ModulePass {
     std::string createTempName() {
       return formatv("T{0,0+6}", NextTemp++).str();
     }
+
+    std::string createBlockName() {
+      return formatv("B{0,0+6}", NextBlock++).str();
+    }
   };
 
   struct ArenaSlot {
@@ -136,10 +139,18 @@ class OS400MIEmitPass : public ModulePass {
     uint32_t Offset = 0;
   };
 
+  struct CompareValue {
+    CmpInst::Predicate Predicate;
+    std::string LHS;
+    std::string RHS;
+  };
+
   class FunctionLowerer {
     NameAllocator Names;
     DenseMap<const Value *, std::string> Values;
+    DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
+    DenseMap<const BasicBlock *, std::string> BlockLabels;
     SmallVector<std::string, 8> Declarations;
     SmallVector<std::string, 16> Body;
     uint32_t NextArenaOffset = FirstArenaOffset;
@@ -159,6 +170,33 @@ class OS400MIEmitPass : public ModulePass {
       if (It == Values.end())
         fail("operands defined by previous supported i32 instructions");
       return It->second;
+    }
+
+    std::string getBlockLabel(const BasicBlock *BB) const {
+      auto It = BlockLabels.find(BB);
+      if (It == BlockLabels.end())
+        fail("branches to blocks in main");
+      return It->second;
+    }
+
+    static StringRef getBranchPredicate(CmpInst::Predicate Predicate) {
+      switch (Predicate) {
+      case CmpInst::ICMP_EQ:
+        return "EQ";
+      case CmpInst::ICMP_NE:
+        return "NEQ";
+      case CmpInst::ICMP_SLT:
+        return "LO";
+      case CmpInst::ICMP_SGT:
+        return "HI";
+      case CmpInst::ICMP_SLE:
+        return "NHI";
+      case CmpInst::ICMP_SGE:
+        return "NLO";
+      default:
+        fail("signed i32 icmp predicates");
+        llvm_unreachable("fail should not return");
+      }
     }
 
     const ArenaSlot &getAllocaSlot(const Value *V) const {
@@ -220,6 +258,15 @@ class OS400MIEmitPass : public ModulePass {
       Values[&BO] = Dest;
     }
 
+    void lowerICmp(const ICmpInst &ICI) {
+      if (!isI32(ICI.getOperand(0)->getType()) ||
+          !isI32(ICI.getOperand(1)->getType()))
+        fail("i32 icmp expressions");
+
+      Comparisons[&ICI] = {ICI.getPredicate(), getOperandName(ICI.getOperand(0)),
+                           getOperandName(ICI.getOperand(1))};
+    }
+
     void lowerStore(const StoreInst &SI) {
       if (!isI32(SI.getValueOperand()->getType()))
         fail("i32 stores");
@@ -245,33 +292,70 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        B           .MAIN;");
     }
 
+    void lowerUnconditionalBranch(const UncondBrInst &BI) {
+      Body.push_back("        B           " + getBlockLabel(BI.getSuccessor(0)) +
+                     ";");
+    }
+
+    void lowerConditionalBranch(const CondBrInst &BI) {
+      const Value *Cond = BI.getCondition();
+      auto It = Comparisons.find(Cond);
+      if (It == Comparisons.end())
+        fail("conditional branches directly from an i32 icmp");
+
+      const CompareValue &Cmp = It->second;
+      StringRef Predicate = getBranchPredicate(Cmp.Predicate);
+      Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
+                     Predicate.str() + "(" + getBlockLabel(BI.getSuccessor(0)) +
+                     ");");
+      Body.push_back("        B           " + getBlockLabel(BI.getSuccessor(1)) +
+                     ";");
+    }
+
   public:
     void lower(const Function &F) {
-      const BasicBlock &BB = F.front();
-      bool SawReturn = false;
-
-      for (const Instruction &I : BB) {
-        if (SawReturn)
-          fail("instructions before a single final ret");
-
-        if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
-          lowerAlloca(*AI);
-        } else if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
-          lowerBinaryOperator(*BO);
-        } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
-          lowerStore(*SI);
-        } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
-          lowerLoad(*LI);
-        } else if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
-          lowerReturn(*RI);
-          SawReturn = true;
-        } else {
-          fail("i32 alloca/store/load/add/sub and ret instructions");
-        }
+      if (F.size() > 1) {
+        for (const BasicBlock &BB : F)
+          BlockLabels[&BB] = Names.createBlockName();
       }
 
-      if (!SawReturn)
-        fail("main ending in ret i32");
+      for (const BasicBlock &BB : F) {
+        if (!BlockLabels.empty() && &BB != &F.front())
+          Body.push_back(getBlockLabel(&BB) + ":");
+
+        bool SawTerminator = false;
+        for (const Instruction &I : BB) {
+          if (SawTerminator)
+            fail("instructions before a single final terminator per block");
+
+          if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
+            lowerAlloca(*AI);
+          } else if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
+            lowerBinaryOperator(*BO);
+          } else if (const auto *ICI = dyn_cast<ICmpInst>(&I)) {
+            lowerICmp(*ICI);
+          } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+            lowerStore(*SI);
+          } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+            lowerLoad(*LI);
+          } else if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
+            lowerReturn(*RI);
+            SawTerminator = true;
+          } else if (const auto *BI = dyn_cast<UncondBrInst>(&I)) {
+            lowerUnconditionalBranch(*BI);
+            SawTerminator = true;
+          } else if (const auto *BI = dyn_cast<CondBrInst>(&I)) {
+            lowerConditionalBranch(*BI);
+            SawTerminator = true;
+          } else {
+            fail("i32 alloca/store/load/add/sub/icmp, branch, and ret "
+                 "instructions");
+          }
+        }
+
+        if (!SawTerminator)
+          fail("each main block ending in ret or branch");
+      }
     }
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }

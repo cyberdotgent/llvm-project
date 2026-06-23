@@ -1051,7 +1051,9 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     static bool isSupportedCallABIType(Type *Ty) {
-      return Ty->isIntegerTy(32) || Ty->isIntegerTy(64) || Ty->isPointerTy();
+      return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+             Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+             Ty->isIntegerTy(64) || Ty->isPointerTy();
     }
 
     static bool isSupportedCallType(const FunctionType *Ty) {
@@ -1065,6 +1067,9 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     static bool isI64Slot(Type *Ty) { return Ty->isIntegerTy(64); }
+    static bool isNarrowIntSlot(Type *Ty) {
+      return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) || Ty->isIntegerTy(16);
+    }
 
     static void declareSlot(SmallVectorImpl<std::string> &Declarations,
                             const FunctionInfo::Slot &Slot) {
@@ -1079,6 +1084,10 @@ class OS400MIEmitPass : public ModulePass {
       else
         Decl += "    BIN(4);";
       Declarations.push_back(std::move(Decl));
+      if (isNarrowIntSlot(Slot.Ty))
+        Declarations.push_back("DCL     DD          " + Slot.Name +
+                               "B   CHAR(4)    DEF(" + Slot.Name +
+                               ") POS(1);");
     }
 
     static FunctionInfo::Slot makeSlot(Type *Ty, StringRef Name) {
@@ -1170,8 +1179,8 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       if (!isSupportedCallType(Ty))
-        fail("non-varargs direct calls between functions using i32/i64/PTR32 "
-             "arguments and returns");
+        fail("non-varargs direct calls between functions using "
+             "i1/i8/i16/i32/i64/PTR32 arguments and returns");
     }
 
     void visitFunction(const Function &F, bool IsMain) {
@@ -1710,12 +1719,19 @@ class OS400MIEmitPass : public ModulePass {
       if (Bits >= 32)
         return;
 
-      uint32_t MaskValue = Bits == 8 ? 0xFF : 0xFFFF;
+      uint32_t MaskValue = Bits == 1 ? 1 : Bits == 8 ? 0xFF : 0xFFFF;
       std::string Mask = createAnonymousTemp("narrow_mask");
       Body.push_back("        CPYNV       " + Mask + "," +
                      std::to_string(MaskValue) + ";");
       Body.push_back("        AND         " + Dest.str() + "B," + Dest.str() +
                      "B," + Mask + "B;");
+    }
+
+    void maskIntegerSlotToType(StringRef Slot, Type *Ty) {
+      if (!Ty->isIntegerTy(1) && !Ty->isIntegerTy(8) &&
+          !Ty->isIntegerTy(16))
+        return;
+      maskIntegerToWidth(Slot, cast<IntegerType>(Ty)->getBitWidth());
     }
 
     void lowerNarrowBinaryOperator(const BinaryOperator &BO) {
@@ -3312,9 +3328,10 @@ class OS400MIEmitPass : public ModulePass {
         fail("defined internal callees; external calls require CALLX ABI");
 
       const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
-      if (!(CB.getType()->isIntegerTy(32) || CB.getType()->isIntegerTy(64) ||
-            CB.getType()->isPointerTy()))
-        fail("direct i32/i64/PTR32 function call results");
+      if (!(CB.getType()->isIntegerTy(1) || CB.getType()->isIntegerTy(8) ||
+            CB.getType()->isIntegerTy(16) || CB.getType()->isIntegerTy(32) ||
+            CB.getType()->isIntegerTy(64) || CB.getType()->isPointerTy()))
+        fail("direct i1/i8/i16/i32/i64/PTR32 function call results");
       if (CB.arg_size() != CalleeInfo.Args.size())
         fail("direct function call arguments matching callee signature");
 
@@ -3332,6 +3349,7 @@ class OS400MIEmitPass : public ModulePass {
 
         Body.push_back("        CPYNV       " + ArgSlot.Name + "," +
                        getOperandName(Arg) + ";");
+        maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
       }
 
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
@@ -3347,6 +3365,7 @@ class OS400MIEmitPass : public ModulePass {
       std::string Dest = createTemp(CB);
       Body.push_back("        CPYNV       " + Dest + "," +
                      CalleeInfo.ReturnSlot.Name + ";");
+      maskIntegerSlotToType(Dest, CB.getType());
       Values[&CB] = Dest;
     }
 
@@ -3362,6 +3381,8 @@ class OS400MIEmitPass : public ModulePass {
         Body.push_back("        CPYNV       " +
                        CurrentFunction->ReturnSlot.Name + "," +
                        getOperandName(Ret) + ";");
+        maskIntegerSlotToType(CurrentFunction->ReturnSlot.Name,
+                              CurrentFunction->ReturnSlot.Ty);
       }
       Body.push_back("        B           " + CurrentFunction->ReturnPointerName +
                      ";");
@@ -3439,8 +3460,10 @@ class OS400MIEmitPass : public ModulePass {
           fail("function arguments matching lowered function signature");
         if (Arg.getType()->isIntegerTy(64))
           I64Values[&Arg] = ArgSlot.I64;
-        else
+        else {
+          maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
           Values[&Arg] = ArgSlot.Name;
+        }
       }
 
       for (const BasicBlock &BB : F) {

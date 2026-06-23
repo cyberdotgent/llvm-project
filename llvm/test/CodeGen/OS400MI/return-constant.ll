@@ -11,6 +11,8 @@ define i32 @main() {
 ; CHECK: DCL     SPCPTR      ARGC@      PARM;
 ; CHECK: DCL     SPCPTR      ARGV@      PARM;
 ; CHECK: DCL     DD          MAIN_RC    BIN(4);
+; CHECK: DCL     DD          C_MEM      CHAR(256) BDRY(16);
+; CHECK: DCL     SPCPTR      .C_BASE    INIT(C_MEM);
 ; CHECK: DCL     INSPTR      .MAIN;
 ; CHECK: ENTRY * (PARM_LIST) EXT;
 ; CHECK:         CALLI       MAIN, *, .MAIN;

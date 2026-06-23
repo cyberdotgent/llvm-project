@@ -4,8 +4,8 @@ target datalayout = "E-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:32-f3
 target triple = "os400mi-ibm-os400"
 
 define i32 @main() {
-  %x = add i32 1, 2
+  %x = mul i32 6, 7
   ret i32 %x
 }
 
-; CHECK: OS400MI MVP only supports main with a single ret instruction
+; CHECK: OS400MI MVP only supports i32 add/sub expressions

@@ -312,7 +312,7 @@ class OS400MIEmitPass : public ModulePass {
 
   static bool isSupportedArenaAggregateType(Type *Ty) {
     if (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
-        Ty->isIntegerTy(32) || Ty->isIntegerTy(64))
+        Ty->isIntegerTy(32) || Ty->isIntegerTy(64) || Ty->isPointerTy())
       return true;
 
     if (const auto *AT = dyn_cast<ArrayType>(Ty))
@@ -725,6 +725,77 @@ class OS400MIEmitPass : public ModulePass {
                       DirectScalar};
     }
 
+    std::optional<uint32_t> getConstantPointerOffset(const Constant *C) const {
+      if (isa<ConstantPointerNull>(C))
+        return 0;
+
+      const Value *Base = C;
+      uint64_t Offset = 0;
+      if (const auto *GEP = dyn_cast<GEPOperator>(C)) {
+        APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
+        if (!GEP->accumulateConstantOffset(DL, ConstantOffset))
+          return std::nullopt;
+        Base = GEP->getPointerOperand()->stripPointerCasts();
+        Offset = ConstantOffset.getZExtValue();
+      } else {
+        Base = C->stripPointerCasts();
+      }
+
+      const auto *GV = dyn_cast<GlobalVariable>(Base);
+      if (!GV)
+        return std::nullopt;
+
+      auto It = Globals.find(GV);
+      if (It == Globals.end() || Offset > It->second.Size)
+        return std::nullopt;
+      return It->second.Offset + Offset;
+    }
+
+    void writeArenaConstantBytes(const Constant *C,
+                                 MutableArrayRef<uint8_t> Bytes) const {
+      if (isa<UndefValue>(C) || isa<ConstantAggregateZero>(C)) {
+        std::fill(Bytes.begin(), Bytes.end(), 0);
+        return;
+      }
+
+      if (C->getType()->isPointerTy()) {
+        std::optional<uint32_t> Offset = getConstantPointerOffset(C);
+        if (!Offset)
+          fail("arena pointer constants referencing laid-out globals or null");
+        storeIntegerBytes(APInt(32, *Offset), Bytes.size(), Bytes);
+        return;
+      }
+
+      Type *Ty = C->getType();
+      if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+        uint64_t EltSize = DL.getTypeAllocSize(AT->getElementType());
+        for (uint64_t I = 0, E = AT->getNumElements(); I != E; ++I) {
+          const Constant *Elt =
+              C->getAggregateElement(static_cast<unsigned>(I));
+          if (!Elt)
+            fail("constant array elements");
+          writeArenaConstantBytes(Elt, Bytes.slice(I * EltSize, EltSize));
+        }
+        return;
+      }
+
+      if (auto *ST = dyn_cast<StructType>(Ty)) {
+        const StructLayout *Layout = DL.getStructLayout(ST);
+        for (unsigned I = 0, E = ST->getNumElements(); I != E; ++I) {
+          Type *EltTy = ST->getElementType(I);
+          uint64_t EltSize = DL.getTypeAllocSize(EltTy);
+          const Constant *Elt = C->getAggregateElement(I);
+          if (!Elt)
+            fail("constant struct elements");
+          writeArenaConstantBytes(
+              Elt, Bytes.slice(Layout->getElementOffset(I), EltSize));
+        }
+        return;
+      }
+
+      OS400MIEmitPass::writeConstantBytes(DL, C, Bytes);
+    }
+
     void layoutIntegerGlobal(const GlobalVariable &GV) {
       const auto *CI = dyn_cast<ConstantInt>(GV.getInitializer());
       if (!CI || !(CI->getType()->isIntegerTy(8) ||
@@ -776,6 +847,34 @@ class OS400MIEmitPass : public ModulePass {
       NextArenaOffset = Offset + Size;
     }
 
+    void layoutPointerGlobal(const GlobalVariable &GV) {
+      if (!GV.getValueType()->isPointerTy())
+        fail("PTR32 globals");
+
+      std::optional<uint32_t> PointerOffset =
+          getConstantPointerOffset(GV.getInitializer());
+      if (!PointerOffset)
+        fail("PTR32 globals initialized with null or laid-out globals");
+
+      uint32_t Size = 4;
+      uint32_t Alignment = 4;
+      uint32_t Offset = alignTo(NextArenaOffset, Alignment);
+      if (Offset + Size > ArenaSize)
+        fail("phase-1 arena storage within 256 bytes");
+
+      std::string Original = getOriginalName(GV);
+      GeneratedName Name = Names.createGlobalName(Original);
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             "    BIN(4)     UNSGND DEF(C_MEM) POS(" +
+                             std::to_string(Offset + 1) + ") INIT(" +
+                             std::to_string(*PointerOffset) + ");");
+      addGlobalObject(GV, Name, "ptr_global", Offset, Size, Alignment,
+                      AccessWidth::I32, true);
+      addMapRecord(Name, "ptr_global", std::move(Original), Offset, Size,
+                   Alignment, getSourceLocation(GV), "ptr32");
+      NextArenaOffset = Offset + Size;
+    }
+
     void layoutStringGlobal(const GlobalVariable &GV,
                             const ConstantDataArray &CDA) {
       if (!CDA.isString())
@@ -814,7 +913,7 @@ class OS400MIEmitPass : public ModulePass {
         fail("phase-1 arena storage within 256 bytes");
 
       SmallVector<uint8_t, 32> Bytes(Size, 0);
-      writeConstantBytes(DL, GV.getInitializer(), Bytes);
+      writeArenaConstantBytes(GV.getInitializer(), Bytes);
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
@@ -844,6 +943,11 @@ class OS400MIEmitPass : public ModulePass {
           continue;
         }
 
+        if (ValueTy->isPointerTy()) {
+          layoutPointerGlobal(GV);
+          continue;
+        }
+
         const auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
         const auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
         if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA &&
@@ -860,9 +964,14 @@ class OS400MIEmitPass : public ModulePass {
           continue;
         }
 
-        fail("i8/i16/i32/i64 globals, constant i8 string globals, and integer "
-             "array/struct globals");
+        fail("i8/i16/i32/i64/PTR32 globals, constant i8 string globals, and "
+             "integer/PTR32 array/struct globals");
       }
+    }
+
+    void writeConstantBytes(const Constant *C,
+                            MutableArrayRef<uint8_t> Bytes) const {
+      writeArenaConstantBytes(C, Bytes);
     }
 
     std::optional<ArenaSlot> getGlobalSlot(const Value *Ptr,
@@ -910,6 +1019,8 @@ class OS400MIEmitPass : public ModulePass {
     bool HasU1Box = false;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
+    static bool isPTR32(Type *Ty) { return Ty && Ty->isPointerTy(); }
+    static bool isI32Like(Type *Ty) { return isI32(Ty) || isPTR32(Ty); }
     static bool isSupportedInt(Type *Ty) {
       return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
                     Ty->isIntegerTy(32) || Ty->isIntegerTy(64));
@@ -917,7 +1028,8 @@ class OS400MIEmitPass : public ModulePass {
 
     static bool isSupportedCompareInt(Type *Ty) {
       return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
-                    Ty->isIntegerTy(32) || Ty->isIntegerTy(64));
+                    Ty->isIntegerTy(32) || Ty->isIntegerTy(64) ||
+                    Ty->isPointerTy());
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
@@ -957,6 +1069,15 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     std::string getOperandName(const Value *V) const {
+      if (V->getType()->isPointerTy()) {
+        auto It = Values.find(V);
+        if (It != Values.end())
+          return It->second;
+        if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
+          return *Offset;
+        fail("PTR32 operands defined by arena pointers or previous loads");
+      }
+
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
         if (!CI->getType()->isIntegerTy(1) &&
             !(CI->getType()->isIntegerTy(8) || CI->getType()->isIntegerTy(16) ||
@@ -1303,6 +1424,141 @@ class OS400MIEmitPass : public ModulePass {
       if (It == Values.end())
         fail("operands defined by previous supported i32 instructions");
       return It->second + "B";
+    }
+
+    void maskIntegerToWidth(StringRef Dest, unsigned Bits) {
+      if (Bits >= 32)
+        return;
+
+      uint32_t MaskValue = Bits == 8 ? 0xFF : 0xFFFF;
+      std::string Mask = createAnonymousTemp("narrow_mask");
+      Body.push_back("        CPYNV       " + Mask + "," +
+                     std::to_string(MaskValue) + ";");
+      Body.push_back("        AND         " + Dest.str() + "B," + Dest.str() +
+                     "B," + Mask + "B;");
+    }
+
+    void lowerNarrowBinaryOperator(const BinaryOperator &BO) {
+      Type *Ty = BO.getType();
+      unsigned Bits = cast<IntegerType>(Ty)->getBitWidth();
+      if (Bits != 8 && Bits != 16)
+        fail("i8/i16 arithmetic, bitwise, and shift expressions");
+
+      std::string Dest = createTemp(BO);
+      std::string LHS = getOperandName(BO.getOperand(0));
+      std::string RHS = getOperandName(BO.getOperand(1));
+
+      switch (BO.getOpcode()) {
+      case Instruction::Add:
+        Body.push_back("        ADDN        " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::Sub:
+        Body.push_back("        SUBN        " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::Mul:
+        Body.push_back("        MULT        " + Dest + "," + LHS + "," + RHS +
+                       ";");
+        break;
+      case Instruction::And:
+        Body.push_back("        AND         " + Dest + "B," +
+                       getOperandAsI32Bytes(BO.getOperand(0)) + "," +
+                       getOperandAsI32Bytes(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Or:
+        Body.push_back("        OR          " + Dest + "B," +
+                       getOperandAsI32Bytes(BO.getOperand(0)) + "," +
+                       getOperandAsI32Bytes(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Xor:
+        Body.push_back("        XOR         " + Dest + "B," +
+                       getOperandAsI32Bytes(BO.getOperand(0)) + "," +
+                       getOperandAsI32Bytes(BO.getOperand(1)) + ";");
+        break;
+      case Instruction::Shl:
+        Body.push_back("        CPYBTLLS    " + Dest + "," + LHS + "," +
+                       getConstantShiftAmount(BO.getOperand(1), Bits) + ";");
+        break;
+      case Instruction::LShr:
+        Body.push_back("        CPYBTRLS    " + Dest + "," + LHS + "," +
+                       getConstantShiftAmount(BO.getOperand(1), Bits) + ";");
+        break;
+      default:
+        fail("i8/i16 add/sub/mul/bitwise/constant shift expressions");
+      }
+
+      maskIntegerToWidth(Dest, Bits);
+      Values[&BO] = Dest;
+    }
+
+    void emitI32ShiftLeftOne(StringRef Value) {
+      std::string Scratch = createAnonymousTemp("i32_shift_scratch");
+      Body.push_back("        CPYBTLLS    " + Scratch + "," + Value.str() +
+                     ",1;");
+      Body.push_back("        CPYNV       " + Value.str() + "," + Scratch +
+                     ";");
+    }
+
+    void emitI32LogicalShiftRightOne(StringRef Value) {
+      std::string Scratch = createAnonymousTemp("i32_shift_scratch");
+      Body.push_back("        CPYBTRLS    " + Scratch + "," + Value.str() +
+                     ",1;");
+      Body.push_back("        CPYNV       " + Value.str() + "," + Scratch +
+                     ";");
+    }
+
+    void emitI32ArithmeticShiftRightOne(StringRef Value) {
+      std::string Scratch = createAnonymousTemp("i32_shift_scratch");
+      Body.push_back("        CPYBTRAS    " + Scratch + "," + Value.str() +
+                     ",1;");
+      Body.push_back("        CPYNV       " + Value.str() + "," + Scratch +
+                     ";");
+    }
+
+    void emitI32VariableShift(StringRef Dest, StringRef LHS, StringRef RHS,
+                              Instruction::BinaryOps Op) {
+      std::string Count = createAnonymousTemp("i32_shift_count");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "i32_shift_loop", "", std::nullopt);
+      addMapRecord(DoneName, "i32_shift_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       " + Dest.str() + "," + LHS.str() +
+                     ";");
+      Body.push_back("        CPYNV       " + Count + "," + RHS.str() + ";");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      if (Op == Instruction::Shl)
+        emitI32ShiftLeftOne(Dest);
+      else if (Op == Instruction::LShr)
+        emitI32LogicalShiftRightOne(Dest);
+      else if (Op == Instruction::AShr)
+        emitI32ArithmeticShiftRightOne(Dest);
+      else
+        fail("i32 shift operation");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    std::string getOperandAsI32Bytes(const Value *V) {
+      if (isI32(V->getType()))
+        return getI32ByteOperandName(V);
+
+      if (V->getType()->isIntegerTy(8) || V->getType()->isIntegerTy(16)) {
+        std::string Temp = createAnonymousTemp("narrow_bitwise_operand");
+        Body.push_back("        CPYNV       " + Temp + "," +
+                       getOperandName(V) + ";");
+        maskIntegerToWidth(Temp,
+                           cast<IntegerType>(V->getType())->getBitWidth());
+        return Temp + "B";
+      }
+
+      fail("i8/i16/i32 bitwise operands");
+      llvm_unreachable("fail should not return");
     }
 
     static std::string getConstantShiftAmount(const Value *V) {
@@ -1703,9 +1959,9 @@ class OS400MIEmitPass : public ModulePass {
         fail("static scalar or integer aggregate allocas");
 
       Type *AllocatedTy = AI.getAllocatedType();
-      bool ScalarInt = isSupportedInt(AllocatedTy);
+      bool ScalarInt = isSupportedInt(AllocatedTy) || isPTR32(AllocatedTy);
       AccessWidth Width =
-          ScalarInt ? getIntegerAccessWidth(AllocatedTy) : AccessWidth::I8;
+          ScalarInt ? getAccessWidth(AllocatedTy) : AccessWidth::I8;
       uint32_t Size = 0;
       if (ScalarInt) {
         Size = getAccessWidthBytes(Width);
@@ -1749,6 +2005,11 @@ class OS400MIEmitPass : public ModulePass {
     void lowerBinaryOperator(const BinaryOperator &BO) {
       if (BO.getType()->isIntegerTy(64)) {
         lowerI64BinaryOperator(BO);
+        return;
+      }
+
+      if (BO.getType()->isIntegerTy(8) || BO.getType()->isIntegerTy(16)) {
+        lowerNarrowBinaryOperator(BO);
         return;
       }
 
@@ -1798,19 +2059,28 @@ class OS400MIEmitPass : public ModulePass {
                        getI32ByteOperandName(BO.getOperand(1)) + ";");
         break;
       case Instruction::Shl:
-        Body.push_back("        CPYBTLLS    " + Dest + "," + LHS + "," +
-                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTLLS    " + Dest + "," + LHS + "," +
+                         getConstantShiftAmount(BO.getOperand(1)) + ";");
+        else
+          emitI32VariableShift(Dest, LHS, RHS, BO.getOpcode());
         break;
       case Instruction::LShr:
-        Body.push_back("        CPYBTRLS    " + Dest + "," + LHS + "," +
-                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTRLS    " + Dest + "," + LHS + "," +
+                         getConstantShiftAmount(BO.getOperand(1)) + ";");
+        else
+          emitI32VariableShift(Dest, LHS, RHS, BO.getOpcode());
         break;
       case Instruction::AShr:
-        Body.push_back("        CPYBTRAS    " + Dest + "," + LHS + "," +
-                       getConstantShiftAmount(BO.getOperand(1)) + ";");
+        if (isa<ConstantInt>(BO.getOperand(1)))
+          Body.push_back("        CPYBTRAS    " + Dest + "," + LHS + "," +
+                         getConstantShiftAmount(BO.getOperand(1)) + ";");
+        else
+          emitI32VariableShift(Dest, LHS, RHS, BO.getOpcode());
         break;
       default:
-        fail("i32 arithmetic, bitwise, and constant shift expressions");
+        fail("i32 arithmetic, bitwise, and shift expressions");
       }
 
       Values[&BO] = Dest;
@@ -2023,6 +2293,9 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     std::optional<std::string> tryGetPointerOffsetName(const Value *V) const {
+      if (isa<ConstantPointerNull>(V))
+        return "0";
+
       if (std::optional<uint32_t> Offset = getBaseArenaOffset(V))
         return std::to_string(*Offset);
 
@@ -2116,7 +2389,10 @@ class OS400MIEmitPass : public ModulePass {
                        "," + DynamicOffset + ";");
         DynamicOffset = Twice;
       } else if (DynamicScale != 1) {
-        fail("dynamic getelementptr scale 1, 2, or 4");
+        std::string Scaled = createAnonymousTemp("ptr_offset");
+        Body.push_back("        MULT        " + Scaled + "," + DynamicOffset +
+                       "," + std::to_string(DynamicScale) + ";");
+        DynamicOffset = Scaled;
       }
 
       std::string Offset =
@@ -2146,6 +2422,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     AccessWidth getAccessWidth(Type *Ty) const {
+      if (Ty->isPointerTy())
+        return AccessWidth::I32;
       return getIntegerAccessWidth(Ty);
     }
 
@@ -2245,7 +2523,7 @@ class OS400MIEmitPass : public ModulePass {
         fail("phase-1 aggregate store size");
 
       SmallVector<uint8_t, 32> Bytes(Size, 0);
-      writeConstantBytes(DL, C, Bytes);
+      Layout.writeConstantBytes(C, Bytes);
       return Bytes;
     }
 
@@ -2302,6 +2580,89 @@ class OS400MIEmitPass : public ModulePass {
       emitFillBytesByOffset(getPointerOffsetName(DestPtr), Size, Byte);
     }
 
+    std::string getMemoryLengthName(const Value *V) {
+      if (const auto *CI = dyn_cast<ConstantInt>(V))
+        return std::to_string(CI->getZExtValue());
+
+      if (V->getType()->isIntegerTy(64))
+        return getI64Operand(V).Lo;
+
+      if (V->getType()->isIntegerTy(32))
+        return getOperandName(V);
+
+      fail("i32 or i64 byte counts for memory operations");
+      llvm_unreachable("fail should not return");
+    }
+
+    void emitCopyBytesLoop(const Value *DestPtr, const Value *SourcePtr,
+                           const Value *Length) {
+      ensureU1Box();
+      std::string Dest = createAnonymousTemp("memcpy_dest");
+      std::string Source = createAnonymousTemp("memcpy_source");
+      std::string Count = createAnonymousTemp("memcpy_count");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "memcpy_loop", "", std::nullopt);
+      addMapRecord(DoneName, "memcpy_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getPointerOffsetName(DestPtr) + ";");
+      Body.push_back("        CPYNV       " + Source + "," +
+                     getPointerOffsetName(SourcePtr) + ";");
+      Body.push_back("        CPYNV       " + Count + "," +
+                     getMemoryLengthName(Length) + ";");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      emitSetLensPointerFromOffset(Source);
+      Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+      emitSetLensPointerFromOffset(Dest);
+      Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      Body.push_back("        ADDN        " + Source + "," + Source + ",1;");
+      Body.push_back("        ADDN        " + Dest + "," + Dest + ",1;");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    void emitFillBytesLoop(const Value *DestPtr, const Value *Length,
+                           const Value *Byte) {
+      std::string Dest = createAnonymousTemp("memset_dest");
+      std::string Count = createAnonymousTemp("memset_count");
+      std::optional<std::string> ConstantHex;
+      if (const auto *CI = dyn_cast<ConstantInt>(Byte))
+        ConstantHex = getByteHex(*CI);
+      else {
+        ensureU1Box();
+        Body.push_back("        CPYNV       U1_NUM," + getOperandName(Byte) +
+                       ";");
+      }
+
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "memset_loop", "", std::nullopt);
+      addMapRecord(DoneName, "memset_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getPointerOffsetName(DestPtr) + ";");
+      Body.push_back("        CPYNV       " + Count + "," +
+                     getMemoryLengthName(Length) + ";");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      emitSetLensPointerFromOffset(Dest);
+      if (ConstantHex)
+        Body.push_back("        CPYBLA      LS_I1,X'" + *ConstantHex + "';");
+      else
+        Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      Body.push_back("        ADDN        " + Dest + "," + Dest + ",1;");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
     void emitLoadI64FromOffset(const I64Value &Dest, StringRef SourceBase) {
       for (uint64_t I = 0; I != 8; ++I) {
         emitSetLensPointerFromOffset(getPointerOffsetPlus(SourceBase, I));
@@ -2316,21 +2677,27 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
 
-    static uint64_t getConstantLength(const Value *V) {
+    static std::optional<uint64_t> getConstantLength(const Value *V) {
       const auto *CI = dyn_cast<ConstantInt>(V);
       if (!CI)
-        fail("constant byte counts for aggregate memory operations");
+        return std::nullopt;
       return CI->getZExtValue();
     }
 
     void lowerMemCpy(const MemCpyInst &MI) {
-      uint64_t Size = getConstantLength(MI.getLength());
-      emitCopyBytes(MI.getDest(), MI.getSource(), Size);
+      if (std::optional<uint64_t> Size = getConstantLength(MI.getLength())) {
+        emitCopyBytes(MI.getDest(), MI.getSource(), *Size);
+        return;
+      }
+      emitCopyBytesLoop(MI.getDest(), MI.getSource(), MI.getLength());
     }
 
     void lowerMemSet(const MemSetInst &MI) {
-      uint64_t Size = getConstantLength(MI.getLength());
-      emitFillBytes(MI.getDest(), Size, MI.getValue());
+      if (std::optional<uint64_t> Size = getConstantLength(MI.getLength())) {
+        emitFillBytes(MI.getDest(), *Size, MI.getValue());
+        return;
+      }
+      emitFillBytesLoop(MI.getDest(), MI.getLength(), MI.getValue());
     }
 
     void lowerStore(const StoreInst &SI) {
@@ -2342,7 +2709,7 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      if (!isSupportedInt(ValueTy)) {
+      if (!isSupportedInt(ValueTy) && !isPTR32(ValueTy)) {
         auto AggIt = AggregateValues.find(SI.getValueOperand());
         if (AggIt != AggregateValues.end()) {
           emitCopyBytesByOffset(getPointerOffsetName(SI.getPointerOperand()),
@@ -2380,7 +2747,7 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      if (!isSupportedInt(LI.getType())) {
+      if (!isSupportedInt(LI.getType()) && !isPTR32(LI.getType())) {
         ArenaSlot Slot = createAggregateTemp(LI, LI.getType(), "aggregate_temp");
         emitCopyBytesByOffset(std::to_string(Slot.Offset),
                               getPointerOffsetName(LI.getPointerOperand()),
@@ -2417,7 +2784,7 @@ class OS400MIEmitPass : public ModulePass {
           getIndexedOffset(EVI.getAggregateOperand()->getType(),
                            EVI.getIndices());
 
-      if (isSupportedInt(ResultTy)) {
+      if (isSupportedInt(ResultTy) || isPTR32(ResultTy)) {
         if (ResultTy->isIntegerTy(64)) {
           I64Value Dest = createI64Temp(EVI);
           emitLoadI64FromOffset(Dest, std::to_string(Offset));
@@ -2471,7 +2838,7 @@ class OS400MIEmitPass : public ModulePass {
 
       uint64_t Offset = Slot.Offset + getIndexedOffset(AggTy, IVI.getIndices());
       const Value *Inserted = IVI.getInsertedValueOperand();
-      if (isSupportedInt(Inserted->getType())) {
+      if (isSupportedInt(Inserted->getType()) || isPTR32(Inserted->getType())) {
         if (Inserted->getType()->isIntegerTy(64)) {
           emitStoreI64ToOffset(std::to_string(Offset), getI64Operand(Inserted));
           AggregateValues[&IVI] = Slot;
@@ -2633,8 +3000,8 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      if (!SI.getType()->isIntegerTy(1) && !isI32(SI.getType()))
-        fail("i1/i32 select values");
+      if (!SI.getType()->isIntegerTy(1) && !isI32Like(SI.getType()))
+        fail("i1/i32/PTR32 select values");
       std::string Dest = createTemp(SI);
       GeneratedName TrueName = Names.createBlockName();
       GeneratedName DoneName = Names.createBlockName();
@@ -2716,9 +3083,9 @@ class OS400MIEmitPass : public ModulePass {
                      getSourceLocation(BB));
         BlockLabels[&BB] = Label.Name;
         for (const PHINode &PN : BB.phis()) {
-          if (!PN.getType()->isIntegerTy(1) && !isI32(PN.getType()) &&
+          if (!PN.getType()->isIntegerTy(1) && !isI32Like(PN.getType()) &&
               !PN.getType()->isIntegerTy(64))
-            fail("i1/i32/i64 phi nodes");
+            fail("i1/i32/PTR32/i64 phi nodes");
           BlockPHIs[&BB].push_back(&PN);
           if (PN.getType()->isIntegerTy(64))
             I64Values[&PN] = createI64Temp(PN);

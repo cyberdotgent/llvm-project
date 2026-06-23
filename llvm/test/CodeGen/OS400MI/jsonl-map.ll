@@ -26,12 +26,12 @@ else:
 ; MI: B000002:
 ; MI: B000003:
 
-; MAP: {"mi_name":"C_MEM","kind":"arena","arena_offset":0,"size":256,"alignment":16}
-; MAP-NEXT: {"mi_name":"MAIN_RC","kind":"return_slot","size":4,"alignment":4}
-; MAP-NEXT: {"mi_name":"MAIN","kind":"function","original":"main"}
-; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","original":"entry"}
-; MAP-NEXT: {"mi_name":"B000002","kind":"basic_block","original":"then"}
-; MAP-NEXT: {"mi_name":"B000003","kind":"basic_block","original":"else"}
-; MAP-NEXT: {"mi_name":"S000001","kind":"local","original":"p","arena_offset":4,"size":4,"alignment":4}
-; MAP-NEXT: {"mi_name":"T000001","kind":"temp","original":"v","size":4,"alignment":4}
-; MAP-NEXT: {"mi_name":"T000002","kind":"temp","original":"x","size":4,"alignment":4}
+; MAP: {"mi_name":"C_MEM","kind":"arena","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
+; MAP-NEXT: {"mi_name":"MAIN_RC","kind":"return_slot","name_class":"reserved","max_name_length":48,"collision":false,"size":4,"alignment":4}
+; MAP-NEXT: {"mi_name":"MAIN","kind":"function","name_class":"function","max_name_length":48,"collision":false,"original":"main"}
+; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","name_class":"label","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"entry"}
+; MAP-NEXT: {"mi_name":"B000002","kind":"basic_block","name_class":"label","name_ordinal":2,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"then"}
+; MAP-NEXT: {"mi_name":"B000003","kind":"basic_block","name_class":"label","name_ordinal":3,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"else"}
+; MAP-NEXT: {"mi_name":"S000001","kind":"local","name_class":"local","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"p","arena_offset":4,"size":4,"alignment":4}
+; MAP-NEXT: {"mi_name":"T000001","kind":"temp","name_class":"temp","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"v","size":4,"alignment":4}
+; MAP-NEXT: {"mi_name":"T000002","kind":"temp","name_class":"temp","name_ordinal":2,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"x","size":4,"alignment":4}

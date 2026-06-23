@@ -14,10 +14,12 @@
 #include "TargetInfo/OS400MITargetInfo.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
@@ -36,6 +38,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
@@ -45,6 +48,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 
 using namespace llvm;
@@ -155,32 +159,118 @@ class OS400MIEmitPass : public ModulePass {
     return *Main;
   }
 
+  struct SourceLocationRecord {
+    std::string File;
+    std::optional<unsigned> Line;
+    std::optional<unsigned> Column;
+  };
+
+  struct GeneratedName {
+    std::string Name;
+    std::string Class;
+    uint32_t Ordinal = 0;
+    uint32_t CollisionOrdinal = 0;
+    bool Collision = false;
+    std::string Hash;
+  };
+
   class NameAllocator {
+    static constexpr unsigned MaxMINameLength = 48;
+
+    std::set<std::string> UsedNames;
     unsigned NextSlot = 1;
     unsigned NextTemp = 1;
     unsigned NextBlock = 1;
     unsigned NextGlobal = 1;
     unsigned NextLiteral = 1;
+    unsigned NextHelper = 1;
+
+    static std::string formatOrdinalName(StringRef Prefix, unsigned Ordinal) {
+      return formatv("{0}{1,0+6}", Prefix, Ordinal).str();
+    }
+
+    static std::string getHashMaterial(StringRef Class, StringRef Original) {
+      if (Original.empty())
+        return "";
+
+      std::string Material = Class.str();
+      Material.push_back('\0');
+      Material.append(Original.str());
+      uint32_t Hash = static_cast<uint32_t>(hash_value(StringRef(Material)));
+      std::string Hex;
+      raw_string_ostream OS(Hex);
+      OS << format_hex_no_prefix(Hash, 8, true);
+      return OS.str();
+    }
+
+    unsigned &getCounter(StringRef Class) {
+      if (Class == "local")
+        return NextSlot;
+      if (Class == "temp")
+        return NextTemp;
+      if (Class == "label")
+        return NextBlock;
+      if (Class == "global")
+        return NextGlobal;
+      if (Class == "literal")
+        return NextLiteral;
+      if (Class == "helper")
+        return NextHelper;
+      fail("known generated name class");
+      llvm_unreachable("fail should not return");
+    }
+
+    GeneratedName allocate(StringRef Class, StringRef Prefix,
+                           StringRef Original = "") {
+      unsigned &Next = getCounter(Class);
+      unsigned Ordinal = Next++;
+      std::string Hash = getHashMaterial(Class, Original);
+      std::string Name = formatOrdinalName(Prefix, Ordinal);
+      if (Name.size() > MaxMINameLength)
+        fail("generated MI names no longer than 48 characters");
+
+      uint32_t CollisionOrdinal = 0;
+      bool Collision = !UsedNames.insert(Name).second;
+      while (Collision) {
+        ++CollisionOrdinal;
+        Name = formatv("{0}{1,0+6}_{2}_{3}", Prefix, Ordinal,
+                       Hash.empty() ? "00000000" : Hash, CollisionOrdinal)
+                   .str();
+        if (Name.size() > MaxMINameLength)
+          fail("generated MI collision names no longer than 48 characters");
+        if (UsedNames.insert(Name).second)
+          break;
+      }
+
+      return {std::move(Name), Class.str(), Ordinal, CollisionOrdinal,
+              Collision, std::move(Hash)};
+    }
 
   public:
-    std::string createSlotName() {
-      return formatv("S{0,0+6}", NextSlot++).str();
+    static constexpr unsigned getMaxMINameLength() { return MaxMINameLength; }
+
+    GeneratedName createSlotName(StringRef Original = "") {
+      return allocate("local", "S", Original);
     }
 
-    std::string createTempName() {
-      return formatv("T{0,0+6}", NextTemp++).str();
+    GeneratedName createTempName(StringRef Original = "") {
+      return allocate("temp", "T", Original);
     }
 
-    std::string createBlockName() {
-      return formatv("B{0,0+6}", NextBlock++).str();
+    GeneratedName createBlockName(StringRef Original = "") {
+      return allocate("label", "B", Original);
     }
 
-    std::string createGlobalName() {
-      return formatv("G{0,0+6}", NextGlobal++).str();
+    GeneratedName createGlobalName(StringRef Original = "") {
+      return allocate("global", "G", Original);
     }
 
-    std::string createLiteralName() {
-      return formatv("L{0,0+6}", NextLiteral++).str();
+    GeneratedName createLiteralName(StringRef Original = "") {
+      return allocate("literal", "L", Original);
+    }
+
+    GeneratedName createHelperName(StringRef Original = "") {
+      return allocate("helper", "H", Original);
     }
   };
 
@@ -202,12 +292,79 @@ class OS400MIEmitPass : public ModulePass {
   struct MapRecord {
     std::string MIName;
     std::string Kind;
+    std::string NameClass;
     std::string Original;
+    std::optional<uint32_t> NameOrdinal;
+    std::optional<uint32_t> CollisionOrdinal;
+    bool Collision = false;
+    std::optional<uint32_t> MaxNameLength;
+    std::string Hash;
+    std::optional<SourceLocationRecord> SourceLocation;
     std::optional<uint32_t> ArenaOffset;
     std::optional<uint32_t> Size;
     std::optional<uint32_t> Alignment;
     std::string Encoding;
   };
+
+  static SourceLocationRecord getSourceLocationRecord(const DILocation &Loc) {
+    SourceLocationRecord Record;
+    if (DILocalScope *Scope = Loc.getScope()) {
+      if (DIFile *File = Scope->getFile()) {
+        Record.File = File->getFilename().str();
+        if (Record.File.empty())
+          Record.File = File->getDirectory().str();
+      }
+    }
+    Record.Line = Loc.getLine();
+    Record.Column = Loc.getColumn();
+    return Record;
+  }
+
+  static std::optional<SourceLocationRecord>
+  getSourceLocation(const Instruction &I) {
+    if (DebugLoc Loc = I.getDebugLoc())
+      return getSourceLocationRecord(*Loc);
+    return std::nullopt;
+  }
+
+  static std::optional<SourceLocationRecord>
+  getSourceLocation(const BasicBlock &BB) {
+    for (const Instruction &I : BB) {
+      if (std::optional<SourceLocationRecord> Loc = getSourceLocation(I))
+        return Loc;
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<SourceLocationRecord>
+  getSourceLocation(const Function &F) {
+    if (DISubprogram *SP = F.getSubprogram()) {
+      SourceLocationRecord Record;
+      if (DIFile *File = SP->getFile())
+        Record.File = File->getFilename().str();
+      Record.Line = SP->getLine();
+      return Record;
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<SourceLocationRecord>
+  getSourceLocation(const GlobalVariable &GV) {
+    SmallVector<DIGlobalVariableExpression *, 1> GVs;
+    GV.getDebugInfo(GVs);
+    if (GVs.empty())
+      return std::nullopt;
+
+    DIGlobalVariable *DIGV = GVs.front()->getVariable();
+    if (!DIGV)
+      return std::nullopt;
+
+    SourceLocationRecord Record;
+    if (DIFile *File = DIGV->getFile())
+      Record.File = File->getFilename().str();
+    Record.Line = DIGV->getLine();
+    return Record;
+  }
 
   class ArenaLayout {
     struct GlobalObject {
@@ -345,19 +502,33 @@ class OS400MIEmitPass : public ModulePass {
       return Hex;
     }
 
-    void addMapRecord(std::string MIName, std::string Kind,
+    void addMapRecord(const GeneratedName &Name, std::string Kind,
                       std::string Original, uint32_t ArenaOffset,
                       uint32_t Size, uint32_t Alignment,
+                      std::optional<SourceLocationRecord> SourceLocation,
                       std::string Encoding = "") {
-      MapRecords.push_back({std::move(MIName), std::move(Kind),
-                            std::move(Original), ArenaOffset, Size, Alignment,
+      MapRecords.push_back({Name.Name,
+                            std::move(Kind),
+                            Name.Class,
+                            std::move(Original),
+                            Name.Ordinal,
+                            Name.Collision ? std::optional<uint32_t>(
+                                                 Name.CollisionOrdinal)
+                                           : std::nullopt,
+                            Name.Collision,
+                            NameAllocator::getMaxMINameLength(),
+                            Name.Hash,
+                            std::move(SourceLocation),
+                            ArenaOffset,
+                            Size,
+                            Alignment,
                             std::move(Encoding)});
     }
 
-    void addGlobalObject(const GlobalVariable &GV, std::string Name,
+    void addGlobalObject(const GlobalVariable &GV, const GeneratedName &Name,
                          std::string Kind, uint32_t Offset, uint32_t Size,
                          uint32_t Alignment) {
-      Globals[&GV] = {Name, Kind, Offset, Size, Alignment};
+      Globals[&GV] = {Name.Name, Kind, Offset, Size, Alignment};
     }
 
     void layoutI32Global(const GlobalVariable &GV) {
@@ -369,14 +540,16 @@ class OS400MIEmitPass : public ModulePass {
       if (Offset + 4 > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
-      std::string Name = Names.createGlobalName();
+      std::string Original = getOriginalName(GV);
+      GeneratedName Name = Names.createGlobalName(Original);
       int32_t InitialValue = static_cast<int32_t>(CI->getSExtValue());
-      Declarations.push_back("DCL     DD          " + Name +
+      Declarations.push_back("DCL     DD          " + Name.Name +
                              "    BIN(4)     DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(" +
                              std::to_string(InitialValue) + ");");
       addGlobalObject(GV, Name, "global", Offset, 4, 4);
-      addMapRecord(Name, "global", getOriginalName(GV), Offset, 4, 4);
+      addMapRecord(Name, "global", std::move(Original), Offset, 4, 4,
+                   getSourceLocation(GV));
       NextArenaOffset = Offset + 4;
     }
 
@@ -391,16 +564,17 @@ class OS400MIEmitPass : public ModulePass {
       if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
-      std::string Name = Names.createLiteralName();
+      std::string Original = getOriginalName(GV);
+      GeneratedName Name = Names.createLiteralName(Original);
       std::string Hex = encodeCP37Hex(Bytes);
-      Declarations.push_back("DCL     DD          " + Name + "    CHAR(" +
+      Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
                              std::to_string(Size) +
                              ")    DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(X'" + Hex +
                              "');");
       addGlobalObject(GV, Name, "string", Offset, Size, 1);
-      addMapRecord(Name, "string", getOriginalName(GV), Offset, Size, 1,
-                   "ibm-037");
+      addMapRecord(Name, "string", std::move(Original), Offset, Size, 1,
+                   getSourceLocation(GV), "ibm-037");
       NextArenaOffset = Offset + Size;
     }
 
@@ -495,13 +669,28 @@ class OS400MIEmitPass : public ModulePass {
       return "";
     }
 
-    void addMapRecord(std::string MIName, std::string Kind,
+    void addMapRecord(const GeneratedName &Name, std::string Kind,
                       std::string Original = "",
+                      std::optional<SourceLocationRecord> SourceLocation =
+                          std::nullopt,
                       std::optional<uint32_t> ArenaOffset = std::nullopt,
                       std::optional<uint32_t> Size = std::nullopt,
                       std::optional<uint32_t> Alignment = std::nullopt) {
-      MapRecords.push_back({std::move(MIName), std::move(Kind),
-                            std::move(Original), ArenaOffset, Size, Alignment,
+      MapRecords.push_back({Name.Name,
+                            std::move(Kind),
+                            Name.Class,
+                            std::move(Original),
+                            Name.Ordinal,
+                            Name.Collision ? std::optional<uint32_t>(
+                                                 Name.CollisionOrdinal)
+                                           : std::nullopt,
+                            Name.Collision,
+                            NameAllocator::getMaxMINameLength(),
+                            Name.Hash,
+                            std::move(SourceLocation),
+                            ArenaOffset,
+                            Size,
+                            Alignment,
                             ""});
     }
 
@@ -618,17 +807,24 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     std::string createTemp(const Value &V) {
-      std::string Name = Names.createTempName();
-      Declarations.push_back("DCL     DD          " + Name + "    BIN(4);");
-      addMapRecord(Name, "temp", getOriginalName(V), std::nullopt, 4, 4);
-      return Name;
+      std::string Original = getOriginalName(V);
+      GeneratedName Name = Names.createTempName(Original);
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             "    BIN(4);");
+      addMapRecord(Name, "temp", std::move(Original),
+                   isa<Instruction>(&V)
+                       ? getSourceLocation(cast<Instruction>(V))
+                       : std::nullopt,
+                   std::nullopt, 4, 4);
+      return Name.Name;
     }
 
     std::string createAnonymousTemp(StringRef Kind) {
-      std::string Name = Names.createTempName();
-      Declarations.push_back("DCL     DD          " + Name + "    BIN(4);");
-      addMapRecord(Name, Kind.str(), "", std::nullopt, 4, 4);
-      return Name;
+      GeneratedName Name = Names.createTempName();
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             "    BIN(4);");
+      addMapRecord(Name, Kind.str(), "", std::nullopt, std::nullopt, 4, 4);
+      return Name.Name;
     }
 
     void lowerAlloca(const AllocaInst &AI) {
@@ -653,7 +849,9 @@ class OS400MIEmitPass : public ModulePass {
       if (Offset + Size > ArenaSize)
         fail("phase-1 arena storage within 256 bytes");
 
-      ArenaSlot Slot{Names.createSlotName(), Offset, Size, ScalarI32};
+      std::string Original = getOriginalName(AI);
+      GeneratedName SlotName = Names.createSlotName(Original);
+      ArenaSlot Slot{SlotName.Name, Offset, Size, ScalarI32};
       NextArenaOffset = Offset + Size;
       Slots[&AI] = Slot;
       if (ScalarI32) {
@@ -666,8 +864,8 @@ class OS400MIEmitPass : public ModulePass {
                                ")    DEF(C_MEM) POS(" +
                                std::to_string(Slot.Offset + 1) + ");");
       }
-      addMapRecord(Slot.Name, "local", getOriginalName(AI), Slot.Offset, Size,
-                   4);
+      addMapRecord(SlotName, "local", std::move(Original),
+                   getSourceLocation(AI), Slot.Offset, Size, 4);
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
@@ -716,10 +914,12 @@ class OS400MIEmitPass : public ModulePass {
 
       const CompareValue &Cmp = It->second;
       std::string Dest = createTemp(ICI);
-      std::string TrueLabel = Names.createBlockName();
-      std::string DoneLabel = Names.createBlockName();
-      addMapRecord(TrueLabel, "bool_true");
-      addMapRecord(DoneLabel, "bool_done");
+      GeneratedName TrueName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string TrueLabel = TrueName.Name;
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(TrueName, "bool_true", "", getSourceLocation(ICI));
+      addMapRecord(DoneName, "bool_done", "", getSourceLocation(ICI));
       Body.push_back("        CPYNV       " + Dest + ",0;");
       Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
                      getBranchPredicate(Cmp.Predicate).str() + "(" +
@@ -966,10 +1166,12 @@ class OS400MIEmitPass : public ModulePass {
 
       const CompareValue &Cmp = It->second;
       std::string Dest = createTemp(SI);
-      std::string TrueLabel = Names.createBlockName();
-      std::string DoneLabel = Names.createBlockName();
-      addMapRecord(TrueLabel, "select_true");
-      addMapRecord(DoneLabel, "select_done");
+      GeneratedName TrueName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string TrueLabel = TrueName.Name;
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(TrueName, "select_true", "", getSourceLocation(SI));
+      addMapRecord(DoneName, "select_done", "", getSourceLocation(SI));
       Body.push_back("        CPYNV       " + Dest + "," +
                      getOperandName(SI.getFalseValue()) + ";");
       Body.push_back("        CMPNV(B)    " + Cmp.LHS + "," + Cmp.RHS + "/" +
@@ -1022,8 +1224,10 @@ class OS400MIEmitPass : public ModulePass {
       if (!hasPHIs(Succ))
         return getBlockLabel(Succ);
 
-      std::string EdgeLabel = Names.createBlockName();
-      addMapRecord(EdgeLabel, "edge_block");
+      GeneratedName EdgeName = Names.createBlockName();
+      std::string EdgeLabel = EdgeName.Name;
+      addMapRecord(EdgeName, "edge_block", "",
+                   getSourceLocation(*Succ));
       EdgeBlocks.push_back(EdgeLabel + ":");
       for (const PHINode *PN : BlockPHIs[Succ]) {
         Value *Incoming = PN->getIncomingValueForBlock(Pred);
@@ -1041,9 +1245,11 @@ class OS400MIEmitPass : public ModulePass {
 
     void lower(const Function &F) {
       for (const BasicBlock &BB : F) {
-        std::string Label = Names.createBlockName();
-        addMapRecord(Label, "basic_block", getOriginalName(BB));
-        BlockLabels[&BB] = std::move(Label);
+        std::string Original = getOriginalName(BB);
+        GeneratedName Label = Names.createBlockName(Original);
+        addMapRecord(Label, "basic_block", std::move(Original),
+                     getSourceLocation(BB));
+        BlockLabels[&BB] = Label.Name;
         for (const PHINode &PN : BB.phis()) {
           if (!isI32(PN.getType()))
             fail("i32 phi nodes");
@@ -1135,14 +1341,73 @@ class OS400MIEmitPass : public ModulePass {
     OS << "        PEND;\n";
   }
 
+  static MapRecord makeFixedMapRecord(
+      std::string MIName, std::string Kind, std::string NameClass,
+      std::string Original = "",
+      std::optional<SourceLocationRecord> SourceLocation = std::nullopt,
+      std::optional<uint32_t> ArenaOffset = std::nullopt,
+      std::optional<uint32_t> Size = std::nullopt,
+      std::optional<uint32_t> Alignment = std::nullopt) {
+    if (MIName.size() > NameAllocator::getMaxMINameLength())
+      fail("fixed MI names no longer than 48 characters");
+
+    MapRecord Record;
+    Record.MIName = std::move(MIName);
+    Record.Kind = std::move(Kind);
+    Record.NameClass = std::move(NameClass);
+    Record.Original = std::move(Original);
+    Record.MaxNameLength = NameAllocator::getMaxMINameLength();
+    Record.SourceLocation = std::move(SourceLocation);
+    Record.ArenaOffset = ArenaOffset;
+    Record.Size = Size;
+    Record.Alignment = Alignment;
+    return Record;
+  }
+
   void emitMapRecord(raw_ostream &MapOS, const MapRecord &Record) {
     MapOS << "{\"mi_name\":";
     writeJSONString(MapOS, Record.MIName);
     MapOS << ",\"kind\":";
     writeJSONString(MapOS, Record.Kind);
+    if (!Record.NameClass.empty()) {
+      MapOS << ",\"name_class\":";
+      writeJSONString(MapOS, Record.NameClass);
+    }
+    if (Record.NameOrdinal)
+      MapOS << ",\"name_ordinal\":" << *Record.NameOrdinal;
+    if (Record.MaxNameLength)
+      MapOS << ",\"max_name_length\":" << *Record.MaxNameLength;
+    MapOS << ",\"collision\":" << (Record.Collision ? "true" : "false");
+    if (Record.CollisionOrdinal)
+      MapOS << ",\"collision_ordinal\":" << *Record.CollisionOrdinal;
+    if (!Record.Hash.empty()) {
+      MapOS << ",\"hash\":";
+      writeJSONString(MapOS, Record.Hash);
+    }
     if (!Record.Original.empty()) {
       MapOS << ",\"original\":";
       writeJSONString(MapOS, Record.Original);
+    }
+    if (Record.SourceLocation) {
+      MapOS << ",\"source_location\":{";
+      bool NeedComma = false;
+      if (!Record.SourceLocation->File.empty()) {
+        MapOS << "\"file\":";
+        writeJSONString(MapOS, Record.SourceLocation->File);
+        NeedComma = true;
+      }
+      if (Record.SourceLocation->Line) {
+        if (NeedComma)
+          MapOS << ",";
+        MapOS << "\"line\":" << *Record.SourceLocation->Line;
+        NeedComma = true;
+      }
+      if (Record.SourceLocation->Column) {
+        if (NeedComma)
+          MapOS << ",";
+        MapOS << "\"column\":" << *Record.SourceLocation->Column;
+      }
+      MapOS << "}";
     }
     if (Record.ArenaOffset)
       MapOS << ",\"arena_offset\":" << *Record.ArenaOffset;
@@ -1157,7 +1422,8 @@ class OS400MIEmitPass : public ModulePass {
     MapOS << "}\n";
   }
 
-  void emitMapFile(const ArenaLayout &Layout, const FunctionLowerer &Lowerer) {
+  void emitMapFile(const ArenaLayout &Layout, const FunctionLowerer &Lowerer,
+                   const Function &Main) {
     if (OutputFilename.empty() || OutputFilename == "-")
       return;
 
@@ -1170,11 +1436,14 @@ class OS400MIEmitPass : public ModulePass {
                          false);
 
     emitMapRecord(MapOS,
-                  {"C_MEM", "arena", "", 0, Layout.getArenaSize(), 16, ""});
+                  makeFixedMapRecord("C_MEM", "arena", "reserved", "", {},
+                                     0, Layout.getArenaSize(), 16));
+    emitMapRecord(MapOS, makeFixedMapRecord("MAIN_RC", "return_slot",
+                                            "reserved", "", {}, std::nullopt,
+                                            4, 4));
     emitMapRecord(MapOS,
-                  {"MAIN_RC", "return_slot", "", std::nullopt, 4, 4, ""});
-    emitMapRecord(MapOS, {"MAIN", "function", "main", std::nullopt,
-                          std::nullopt, std::nullopt, ""});
+                  makeFixedMapRecord("MAIN", "function", "function", "main",
+                                     getSourceLocation(Main)));
     for (const MapRecord &Record : Layout.getMapRecords())
       emitMapRecord(MapOS, Record);
     for (const MapRecord &Record : Lowerer.getMapRecords())
@@ -1196,7 +1465,7 @@ public:
     FunctionLowerer Lowerer(M.getDataLayout(), Layout);
     Lowerer.lower(Main);
     emitProgram(Layout, Lowerer);
-    emitMapFile(Layout, Lowerer);
+    emitMapFile(Layout, Lowerer, Main);
     return false;
   }
 };

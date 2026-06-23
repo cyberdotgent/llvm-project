@@ -4901,8 +4901,11 @@ renderDebugOptions(const ToolChain &TC, const Driver &D, const llvm::Triple &T,
 
   addDebugPrefixMapArg(D, TC, Args, CmdArgs);
 
-  // Add the output path to the object file for CodeView debug infos.
-  if (EmitCodeView && Output.isFilename())
+  // Add the output path to the object file for CodeView debug infos. OS400MI
+  // also uses this cc1 option to derive the default symbolic-MI sidecar map
+  // path, so pass it even without debug info for that target.
+  if ((EmitCodeView || T.getArch() == llvm::Triple::os400mi) &&
+      Output.isFilename())
     addDebugObjectName(Args, CmdArgs, DebugCompilationDir,
                        Output.getFilename());
 }

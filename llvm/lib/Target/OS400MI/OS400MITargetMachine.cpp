@@ -34,6 +34,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -86,12 +87,49 @@ public:
 
 class OS400MIEmitPass : public ModulePass {
   raw_ostream &OS;
+  std::string OutputFilename;
 
   static constexpr uint32_t ArenaSize = 256;
   static constexpr uint32_t FirstArenaOffset = 4;
 
   static void fail(const Twine &Message) {
     report_fatal_error("OS400MI MVP only supports " + Message, false);
+  }
+
+  static void writeJSONString(raw_ostream &OS, StringRef S) {
+    OS << '"';
+    for (char C : S) {
+      switch (C) {
+      case '"':
+        OS << "\\\"";
+        break;
+      case '\\':
+        OS << "\\\\";
+        break;
+      case '\b':
+        OS << "\\b";
+        break;
+      case '\f':
+        OS << "\\f";
+        break;
+      case '\n':
+        OS << "\\n";
+        break;
+      case '\r':
+        OS << "\\r";
+        break;
+      case '\t':
+        OS << "\\t";
+        break;
+      default:
+        if (static_cast<unsigned char>(C) < 0x20)
+          OS << formatv("\\u{0,0+4:X}", static_cast<unsigned char>(C));
+        else
+          OS << C;
+        break;
+      }
+    }
+    OS << '"';
   }
 
   static const Function &getMainFunction(const Module &M) {
@@ -145,6 +183,15 @@ class OS400MIEmitPass : public ModulePass {
     std::string RHS;
   };
 
+  struct MapRecord {
+    std::string MIName;
+    std::string Kind;
+    std::string Original;
+    std::optional<uint32_t> ArenaOffset;
+    std::optional<uint32_t> Size;
+    std::optional<uint32_t> Alignment;
+  };
+
   class FunctionLowerer {
     NameAllocator Names;
     DenseMap<const Value *, std::string> Values;
@@ -153,11 +200,28 @@ class OS400MIEmitPass : public ModulePass {
     DenseMap<const BasicBlock *, std::string> BlockLabels;
     SmallVector<std::string, 8> Declarations;
     SmallVector<std::string, 16> Body;
+    SmallVector<MapRecord, 16> MapRecords;
     uint32_t NextArenaOffset = FirstArenaOffset;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
+
+    static std::string getOriginalName(const Value &V) {
+      if (V.hasName())
+        return V.getName().str();
+      return "";
+    }
+
+    void addMapRecord(std::string MIName, std::string Kind,
+                      std::string Original = "",
+                      std::optional<uint32_t> ArenaOffset = std::nullopt,
+                      std::optional<uint32_t> Size = std::nullopt,
+                      std::optional<uint32_t> Alignment = std::nullopt) {
+      MapRecords.push_back({std::move(MIName), std::move(Kind),
+                            std::move(Original), ArenaOffset, Size,
+                            Alignment});
+    }
 
     std::string getOperandName(const Value *V) const {
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
@@ -210,9 +274,10 @@ class OS400MIEmitPass : public ModulePass {
       return It->second;
     }
 
-    std::string createTemp() {
+    std::string createTemp(const Value &V) {
       std::string Name = Names.createTempName();
       Declarations.push_back("DCL     DD          " + Name + "    BIN(4);");
+      addMapRecord(Name, "temp", getOriginalName(V), std::nullopt, 4, 4);
       return Name;
     }
 
@@ -232,13 +297,14 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          " + Slot.Name +
                              "    BIN(4)     DEF(C_MEM) POS(" +
                              std::to_string(Slot.Offset + 1) + ");");
+      addMapRecord(Slot.Name, "local", getOriginalName(AI), Slot.Offset, 4, 4);
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
       if (!isI32(BO.getType()))
         fail("i32 add/sub expressions");
 
-      std::string Dest = createTemp();
+      std::string Dest = createTemp(BO);
       std::string LHS = getOperandName(BO.getOperand(0));
       std::string RHS = getOperandName(BO.getOperand(1));
 
@@ -279,7 +345,7 @@ class OS400MIEmitPass : public ModulePass {
       if (!isI32(LI.getType()))
         fail("i32 loads");
       const ArenaSlot &Slot = getAllocaSlot(LI.getPointerOperand());
-      std::string Dest = createTemp();
+      std::string Dest = createTemp(LI);
       Body.push_back("        CPYNV       " + Dest + "," + Slot.Name + ";");
       Values[&LI] = Dest;
     }
@@ -315,12 +381,15 @@ class OS400MIEmitPass : public ModulePass {
   public:
     void lower(const Function &F) {
       if (F.size() > 1) {
-        for (const BasicBlock &BB : F)
-          BlockLabels[&BB] = Names.createBlockName();
+        for (const BasicBlock &BB : F) {
+          std::string Label = Names.createBlockName();
+          addMapRecord(Label, "basic_block", getOriginalName(BB));
+          BlockLabels[&BB] = std::move(Label);
+        }
       }
 
       for (const BasicBlock &BB : F) {
-        if (!BlockLabels.empty() && &BB != &F.front())
+        if (!BlockLabels.empty())
           Body.push_back(getBlockLabel(&BB) + ":");
 
         bool SawTerminator = false;
@@ -360,6 +429,7 @@ class OS400MIEmitPass : public ModulePass {
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }
     ArrayRef<std::string> getBody() const { return Body; }
+    ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
   void emitProgram(const FunctionLowerer &Lowerer) {
@@ -388,10 +458,49 @@ class OS400MIEmitPass : public ModulePass {
     OS << "        PEND;\n";
   }
 
+  void emitMapRecord(raw_ostream &MapOS, const MapRecord &Record) {
+    MapOS << "{\"mi_name\":";
+    writeJSONString(MapOS, Record.MIName);
+    MapOS << ",\"kind\":";
+    writeJSONString(MapOS, Record.Kind);
+    if (!Record.Original.empty()) {
+      MapOS << ",\"original\":";
+      writeJSONString(MapOS, Record.Original);
+    }
+    if (Record.ArenaOffset)
+      MapOS << ",\"arena_offset\":" << *Record.ArenaOffset;
+    if (Record.Size)
+      MapOS << ",\"size\":" << *Record.Size;
+    if (Record.Alignment)
+      MapOS << ",\"alignment\":" << *Record.Alignment;
+    MapOS << "}\n";
+  }
+
+  void emitMapFile(const FunctionLowerer &Lowerer) {
+    if (OutputFilename.empty() || OutputFilename == "-")
+      return;
+
+    std::string MapFilename = OutputFilename + ".jsonl";
+    std::error_code EC;
+    raw_fd_ostream MapOS(MapFilename, EC, sys::fs::OF_Text);
+    if (EC)
+      report_fatal_error(Twine("failed to open OS400MI map file '") +
+                             MapFilename + "': " + EC.message(),
+                         false);
+
+    emitMapRecord(MapOS, {"C_MEM", "arena", "", 0, ArenaSize, 16});
+    emitMapRecord(MapOS, {"MAIN_RC", "return_slot", "", std::nullopt, 4, 4});
+    emitMapRecord(MapOS, {"MAIN", "function", "main", std::nullopt,
+                          std::nullopt, std::nullopt});
+    for (const MapRecord &Record : Lowerer.getMapRecords())
+      emitMapRecord(MapOS, Record);
+  }
+
 public:
   static char ID;
 
-  explicit OS400MIEmitPass(raw_ostream &OS) : ModulePass(ID), OS(OS) {}
+  explicit OS400MIEmitPass(raw_ostream &OS, StringRef OutputFilename)
+      : ModulePass(ID), OS(OS), OutputFilename(OutputFilename.str()) {}
 
   StringRef getPassName() const override { return "OS400MI MI Source Emitter"; }
 
@@ -400,6 +509,7 @@ public:
     FunctionLowerer Lowerer;
     Lowerer.lower(Main);
     emitProgram(Lowerer);
+    emitMapFile(Lowerer);
     return false;
   }
 };
@@ -415,7 +525,7 @@ bool OS400MITargetMachine::addPassesToEmitFile(
   switch (FileType) {
   case CodeGenFileType::AssemblyFile:
   case CodeGenFileType::ObjectFile:
-    PM.add(new OS400MIEmitPass(Out));
+    PM.add(new OS400MIEmitPass(Out, Options.ObjectFilenameForDebug));
     return false;
   case CodeGenFileType::Null:
     return false;

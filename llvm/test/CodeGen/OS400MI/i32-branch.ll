@@ -18,6 +18,7 @@ else:
 
 ; CHECK: DCL     DD          T000001    BIN(4);
 ; CHECK: ENTRY MAIN INT;
+; CHECK: B000001:
 ; CHECK:         ADDN        T000001,1,2;
 ; CHECK:         CMPNV(B)    T000001,3/EQ(B000002);
 ; CHECK:         B           B000003;

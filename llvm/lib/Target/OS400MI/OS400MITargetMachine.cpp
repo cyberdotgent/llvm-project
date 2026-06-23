@@ -23,6 +23,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/MC/MCAsmInfo.h"
@@ -157,6 +158,8 @@ class OS400MIEmitPass : public ModulePass {
     unsigned NextSlot = 1;
     unsigned NextTemp = 1;
     unsigned NextBlock = 1;
+    unsigned NextGlobal = 1;
+    unsigned NextLiteral = 1;
 
   public:
     std::string createSlotName() {
@@ -169,6 +172,14 @@ class OS400MIEmitPass : public ModulePass {
 
     std::string createBlockName() {
       return formatv("B{0,0+6}", NextBlock++).str();
+    }
+
+    std::string createGlobalName() {
+      return formatv("G{0,0+6}", NextGlobal++).str();
+    }
+
+    std::string createLiteralName() {
+      return formatv("L{0,0+6}", NextLiteral++).str();
     }
   };
 
@@ -190,10 +201,255 @@ class OS400MIEmitPass : public ModulePass {
     std::optional<uint32_t> ArenaOffset;
     std::optional<uint32_t> Size;
     std::optional<uint32_t> Alignment;
+    std::string Encoding;
+  };
+
+  class ArenaLayout {
+    struct GlobalObject {
+      std::string Name;
+      std::string Kind;
+      uint32_t Offset = 0;
+      uint32_t Size = 0;
+      uint32_t Alignment = 1;
+    };
+
+    NameAllocator Names;
+    DenseMap<const GlobalVariable *, GlobalObject> Globals;
+    SmallVector<std::string, 8> Declarations;
+    SmallVector<MapRecord, 8> MapRecords;
+    uint32_t NextArenaOffset = FirstArenaOffset;
+
+    static uint32_t alignTo(uint32_t Value, uint32_t Alignment) {
+      return (Value + Alignment - 1) & ~(Alignment - 1);
+    }
+
+    static std::string getOriginalName(const GlobalVariable &GV) {
+      if (GV.hasName())
+        return GV.getName().str();
+      return "";
+    }
+
+    static uint8_t encodeCP37Byte(uint8_t Byte) {
+      if (Byte == 0)
+        return 0;
+
+      switch (Byte) {
+      case '\t':
+        return 0x05;
+      case '\n':
+        return 0x25;
+      case '\r':
+        return 0x0D;
+      case ' ':
+        return 0x40;
+      case '!':
+        return 0x5A;
+      case '"':
+        return 0x7F;
+      case '#':
+        return 0x7B;
+      case '$':
+        return 0x5B;
+      case '%':
+        return 0x6C;
+      case '&':
+        return 0x50;
+      case '\'':
+        return 0x7D;
+      case '(':
+        return 0x4D;
+      case ')':
+        return 0x5D;
+      case '*':
+        return 0x5C;
+      case '+':
+        return 0x4E;
+      case ',':
+        return 0x6B;
+      case '-':
+        return 0x60;
+      case '.':
+        return 0x4B;
+      case '/':
+        return 0x61;
+      case ':':
+        return 0x7A;
+      case ';':
+        return 0x5E;
+      case '<':
+        return 0x4C;
+      case '=':
+        return 0x7E;
+      case '>':
+        return 0x6E;
+      case '?':
+        return 0x6F;
+      case '@':
+        return 0x7C;
+      case '[':
+        return 0xBA;
+      case '\\':
+        return 0xE0;
+      case ']':
+        return 0xBB;
+      case '^':
+        return 0xB0;
+      case '_':
+        return 0x6D;
+      case '`':
+        return 0x79;
+      case '{':
+        return 0xC0;
+      case '|':
+        return 0x4F;
+      case '}':
+        return 0xD0;
+      case '~':
+        return 0xA1;
+      default:
+        break;
+      }
+
+      if (Byte >= '0' && Byte <= '9')
+        return 0xF0 + (Byte - '0');
+      if (Byte >= 'A' && Byte <= 'I')
+        return 0xC1 + (Byte - 'A');
+      if (Byte >= 'J' && Byte <= 'R')
+        return 0xD1 + (Byte - 'J');
+      if (Byte >= 'S' && Byte <= 'Z')
+        return 0xE2 + (Byte - 'S');
+      if (Byte >= 'a' && Byte <= 'i')
+        return 0x81 + (Byte - 'a');
+      if (Byte >= 'j' && Byte <= 'r')
+        return 0x91 + (Byte - 'j');
+      if (Byte >= 's' && Byte <= 'z')
+        return 0xA2 + (Byte - 's');
+
+      fail("ASCII string literal bytes representable as IBM-037");
+      llvm_unreachable("fail should not return");
+    }
+
+    static std::string encodeCP37Hex(StringRef Bytes) {
+      std::string Hex;
+      const char Digits[] = "0123456789ABCDEF";
+      for (uint8_t Byte : Bytes.bytes()) {
+        uint8_t Encoded = encodeCP37Byte(Byte);
+        Hex.push_back(Digits[Encoded >> 4]);
+        Hex.push_back(Digits[Encoded & 0x0F]);
+      }
+      return Hex;
+    }
+
+    void addMapRecord(std::string MIName, std::string Kind,
+                      std::string Original, uint32_t ArenaOffset,
+                      uint32_t Size, uint32_t Alignment,
+                      std::string Encoding = "") {
+      MapRecords.push_back({std::move(MIName), std::move(Kind),
+                            std::move(Original), ArenaOffset, Size, Alignment,
+                            std::move(Encoding)});
+    }
+
+    void addGlobalObject(const GlobalVariable &GV, std::string Name,
+                         std::string Kind, uint32_t Offset, uint32_t Size,
+                         uint32_t Alignment) {
+      Globals[&GV] = {Name, Kind, Offset, Size, Alignment};
+    }
+
+    void layoutI32Global(const GlobalVariable &GV) {
+      const auto *CI = dyn_cast<ConstantInt>(GV.getInitializer());
+      if (!CI || !CI->getType()->isIntegerTy(32))
+        fail("i32 globals with constant integer initializers");
+
+      uint32_t Offset = alignTo(NextArenaOffset, 4);
+      if (Offset + 4 > ArenaSize)
+        fail("phase-1 arena storage within 256 bytes");
+
+      std::string Name = Names.createGlobalName();
+      int32_t InitialValue = static_cast<int32_t>(CI->getSExtValue());
+      Declarations.push_back("DCL     DD          " + Name +
+                             "    BIN(4)     DEF(C_MEM) POS(" +
+                             std::to_string(Offset + 1) + ") INIT(" +
+                             std::to_string(InitialValue) + ");");
+      addGlobalObject(GV, Name, "global", Offset, 4, 4);
+      addMapRecord(Name, "global", getOriginalName(GV), Offset, 4, 4);
+      NextArenaOffset = Offset + 4;
+    }
+
+    void layoutStringGlobal(const GlobalVariable &GV,
+                            const ConstantDataArray &CDA) {
+      if (!CDA.isString())
+        fail("constant i8 string globals");
+
+      StringRef Bytes = CDA.getAsString();
+      uint32_t Size = Bytes.size();
+      uint32_t Offset = alignTo(NextArenaOffset, 1);
+      if (Offset + Size > ArenaSize)
+        fail("phase-1 arena storage within 256 bytes");
+
+      std::string Name = Names.createLiteralName();
+      std::string Hex = encodeCP37Hex(Bytes);
+      Declarations.push_back("DCL     DD          " + Name + "    CHAR(" +
+                             std::to_string(Size) +
+                             ")    DEF(C_MEM) POS(" +
+                             std::to_string(Offset + 1) + ") INIT(X'" + Hex +
+                             "');");
+      addGlobalObject(GV, Name, "string", Offset, Size, 1);
+      addMapRecord(Name, "string", getOriginalName(GV), Offset, Size, 1,
+                   "ibm-037");
+      NextArenaOffset = Offset + Size;
+    }
+
+  public:
+    explicit ArenaLayout(const DataLayout &) {}
+
+    void lower(const Module &M) {
+      for (const GlobalVariable &GV : M.globals()) {
+        if (GV.isDeclaration())
+          fail("defined globals only");
+
+        Type *ValueTy = GV.getValueType();
+        if (ValueTy->isIntegerTy(32)) {
+          layoutI32Global(GV);
+          continue;
+        }
+
+        const auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
+        const auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
+        if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA) {
+          layoutStringGlobal(GV, *CDA);
+          continue;
+        }
+
+        fail("i32 globals and constant i8 string globals");
+      }
+    }
+
+    std::optional<ArenaSlot> getI32GlobalSlot(const Value *Ptr,
+                                              uint64_t Offset) const {
+      const auto *GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts());
+      if (!GV)
+        return std::nullopt;
+
+      auto It = Globals.find(GV);
+      if (It == Globals.end() || It->second.Kind != "global" || Offset != 0)
+        return std::nullopt;
+      return ArenaSlot{It->second.Name, It->second.Offset};
+    }
+
+    uint32_t getNextArenaOffset() const { return NextArenaOffset; }
+
+    uint32_t getArenaSize() const {
+      return std::max<uint32_t>(ArenaSize, alignTo(NextArenaOffset, 16));
+    }
+
+    ArrayRef<std::string> getDeclarations() const { return Declarations; }
+    ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
   class FunctionLowerer {
     NameAllocator Names;
+    const DataLayout &DL;
+    const ArenaLayout &Layout;
     DenseMap<const Value *, std::string> Values;
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
@@ -201,7 +457,7 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<std::string, 8> Declarations;
     SmallVector<std::string, 16> Body;
     SmallVector<MapRecord, 16> MapRecords;
-    uint32_t NextArenaOffset = FirstArenaOffset;
+    uint32_t NextArenaOffset;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
 
@@ -219,8 +475,8 @@ class OS400MIEmitPass : public ModulePass {
                       std::optional<uint32_t> Size = std::nullopt,
                       std::optional<uint32_t> Alignment = std::nullopt) {
       MapRecords.push_back({std::move(MIName), std::move(Kind),
-                            std::move(Original), ArenaOffset, Size,
-                            Alignment});
+                            std::move(Original), ArenaOffset, Size, Alignment,
+                            ""});
     }
 
     std::string getOperandName(const Value *V) const {
@@ -263,14 +519,30 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
 
-    const ArenaSlot &getAllocaSlot(const Value *V) const {
+    std::optional<ArenaSlot> getConstantI32GlobalSlot(const Value *V) const {
+      const Value *Base = V;
+      uint64_t Offset = 0;
+      if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+        APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
+        if (!GEP->accumulateConstantOffset(DL, ConstantOffset))
+          fail("constant-offset global arena accesses");
+        Offset = ConstantOffset.getZExtValue();
+        Base = GEP->getPointerOperand();
+      }
+      return Layout.getI32GlobalSlot(Base, Offset);
+    }
+
+    ArenaSlot getI32Slot(const Value *V) const {
       const auto *AI = dyn_cast<AllocaInst>(V);
-      if (!AI)
-        fail("loads and stores through direct i32 allocas");
+      if (!AI) {
+        if (std::optional<ArenaSlot> Slot = getConstantI32GlobalSlot(V))
+          return *Slot;
+        fail("loads and stores through direct i32 allocas or globals");
+      }
 
       auto It = Slots.find(AI);
       if (It == Slots.end())
-        fail("loads and stores through direct i32 allocas");
+        fail("loads and stores through direct i32 allocas or globals");
       return It->second;
     }
 
@@ -336,7 +608,7 @@ class OS400MIEmitPass : public ModulePass {
     void lowerStore(const StoreInst &SI) {
       if (!isI32(SI.getValueOperand()->getType()))
         fail("i32 stores");
-      const ArenaSlot &Slot = getAllocaSlot(SI.getPointerOperand());
+      ArenaSlot Slot = getI32Slot(SI.getPointerOperand());
       Body.push_back("        CPYNV       " + Slot.Name + "," +
                      getOperandName(SI.getValueOperand()) + ";");
     }
@@ -344,7 +616,7 @@ class OS400MIEmitPass : public ModulePass {
     void lowerLoad(const LoadInst &LI) {
       if (!isI32(LI.getType()))
         fail("i32 loads");
-      const ArenaSlot &Slot = getAllocaSlot(LI.getPointerOperand());
+      ArenaSlot Slot = getI32Slot(LI.getPointerOperand());
       std::string Dest = createTemp(LI);
       Body.push_back("        CPYNV       " + Dest + "," + Slot.Name + ";");
       Values[&LI] = Dest;
@@ -379,6 +651,10 @@ class OS400MIEmitPass : public ModulePass {
     }
 
   public:
+    FunctionLowerer(const DataLayout &DL, const ArenaLayout &Layout)
+        : DL(DL), Layout(Layout),
+          NextArenaOffset(Layout.getNextArenaOffset()) {}
+
     void lower(const Function &F) {
       if (F.size() > 1) {
         for (const BasicBlock &BB : F) {
@@ -432,7 +708,7 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
-  void emitProgram(const FunctionLowerer &Lowerer) {
+  void emitProgram(const ArenaLayout &Layout, const FunctionLowerer &Lowerer) {
     OS << "DCL     SPCPTR      ARGC@      PARM;\n";
     OS << "DCL     SPCPTR      ARGV@      PARM;\n";
     OS << "DCL     OL          PARM_LIST\n";
@@ -443,8 +719,11 @@ class OS400MIEmitPass : public ModulePass {
     OS << "DCL     SPCPTR      ARGV       BAS(ARGV@);\n";
     OS << "DCL     DD          NBR_PARMS  BIN(2);\n";
     OS << "DCL     DD          MAIN_RC    BIN(4);\n";
-    OS << "DCL     DD          C_MEM      CHAR(" << ArenaSize << ") BDRY(16);\n";
+    OS << "DCL     DD          C_MEM      CHAR(" << Layout.getArenaSize()
+       << ") BDRY(16);\n";
     OS << "DCL     SPCPTR      .C_BASE    INIT(C_MEM);\n";
+    for (const std::string &Decl : Layout.getDeclarations())
+      OS << Decl << "\n";
     for (const std::string &Decl : Lowerer.getDeclarations())
       OS << Decl << "\n";
     OS << "DCL     INSPTR      .MAIN;\n";
@@ -473,10 +752,14 @@ class OS400MIEmitPass : public ModulePass {
       MapOS << ",\"size\":" << *Record.Size;
     if (Record.Alignment)
       MapOS << ",\"alignment\":" << *Record.Alignment;
+    if (!Record.Encoding.empty()) {
+      MapOS << ",\"encoding\":";
+      writeJSONString(MapOS, Record.Encoding);
+    }
     MapOS << "}\n";
   }
 
-  void emitMapFile(const FunctionLowerer &Lowerer) {
+  void emitMapFile(const ArenaLayout &Layout, const FunctionLowerer &Lowerer) {
     if (OutputFilename.empty() || OutputFilename == "-")
       return;
 
@@ -488,10 +771,14 @@ class OS400MIEmitPass : public ModulePass {
                              MapFilename + "': " + EC.message(),
                          false);
 
-    emitMapRecord(MapOS, {"C_MEM", "arena", "", 0, ArenaSize, 16});
-    emitMapRecord(MapOS, {"MAIN_RC", "return_slot", "", std::nullopt, 4, 4});
+    emitMapRecord(MapOS,
+                  {"C_MEM", "arena", "", 0, Layout.getArenaSize(), 16, ""});
+    emitMapRecord(MapOS,
+                  {"MAIN_RC", "return_slot", "", std::nullopt, 4, 4, ""});
     emitMapRecord(MapOS, {"MAIN", "function", "main", std::nullopt,
-                          std::nullopt, std::nullopt});
+                          std::nullopt, std::nullopt, ""});
+    for (const MapRecord &Record : Layout.getMapRecords())
+      emitMapRecord(MapOS, Record);
     for (const MapRecord &Record : Lowerer.getMapRecords())
       emitMapRecord(MapOS, Record);
   }
@@ -506,10 +793,12 @@ public:
 
   bool runOnModule(Module &M) override {
     const Function &Main = getMainFunction(M);
-    FunctionLowerer Lowerer;
+    ArenaLayout Layout(M.getDataLayout());
+    Layout.lower(M);
+    FunctionLowerer Lowerer(M.getDataLayout(), Layout);
     Lowerer.lower(Main);
-    emitProgram(Lowerer);
-    emitMapFile(Lowerer);
+    emitProgram(Layout, Lowerer);
+    emitMapFile(Layout, Lowerer);
     return false;
   }
 };

@@ -409,6 +409,38 @@ class OS400MIEmitPass : public ModulePass {
     std::array<std::string, 8> Byte;
   };
 
+  static I64Value makeI64Value(StringRef BaseName) {
+    I64Value Value;
+    Value.Bytes = BaseName.str();
+    Value.Hi = (BaseName + "H").str();
+    Value.HiU = (BaseName + "U").str();
+    Value.Lo = (BaseName + "L").str();
+    Value.LoBytes = (BaseName + "LB").str();
+    for (unsigned I = 0; I != 8; ++I)
+      Value.Byte[I] = formatv("{0}B{1}", BaseName, I + 1).str();
+    return Value;
+  }
+
+  static void appendI64Declarations(SmallVectorImpl<std::string> &Declarations,
+                                    const I64Value &Value) {
+    Declarations.push_back("DCL     DD          " + Value.Bytes +
+                           "    CHAR(8);");
+    Declarations.push_back("DCL     DD          " + Value.Hi +
+                           "    BIN(4)     DEF(" + Value.Bytes + ") POS(1);");
+    Declarations.push_back("DCL     DD          " + Value.HiU +
+                           "    BIN(4)     UNSGND DEF(" + Value.Bytes +
+                           ") POS(1);");
+    Declarations.push_back("DCL     DD          " + Value.Lo +
+                           "    BIN(4)     UNSGND DEF(" + Value.Bytes +
+                           ") POS(5);");
+    Declarations.push_back("DCL     DD          " + Value.LoBytes +
+                           "   CHAR(4)    DEF(" + Value.Bytes + ") POS(5);");
+    for (unsigned I = 0; I != 8; ++I)
+      Declarations.push_back("DCL     DD          " + Value.Byte[I] +
+                             "   CHAR(1)    DEF(" + Value.Bytes + ") POS(" +
+                             std::to_string(I + 1) + ");");
+  }
+
   struct I64CompareValue {
     CmpInst::Predicate Predicate;
     I64Value LHS;
@@ -991,11 +1023,17 @@ class OS400MIEmitPass : public ModulePass {
   };
 
   struct FunctionInfo {
+    struct Slot {
+      Type *Ty = nullptr;
+      std::string Name;
+      I64Value I64;
+    };
+
     const Function *F = nullptr;
     std::string EntryName;
     std::string ReturnPointerName;
-    std::string ReturnSlotName;
-    SmallVector<std::string, 4> ArgNames;
+    Slot ReturnSlot;
+    SmallVector<Slot, 4> Args;
   };
 
   class ModuleFunctionPlan {
@@ -1012,14 +1050,44 @@ class OS400MIEmitPass : public ModulePass {
       return "";
     }
 
+    static bool isSupportedCallABIType(Type *Ty) {
+      return Ty->isIntegerTy(32) || Ty->isIntegerTy(64) || Ty->isPointerTy();
+    }
+
     static bool isSupportedCallType(const FunctionType *Ty) {
-      if (Ty->isVarArg() || !Ty->getReturnType()->isIntegerTy(32))
+      if (Ty->isVarArg() || !isSupportedCallABIType(Ty->getReturnType()))
         return false;
       for (Type *ParamTy : Ty->params()) {
-        if (!ParamTy->isIntegerTy(32))
+        if (!isSupportedCallABIType(ParamTy))
           return false;
       }
       return true;
+    }
+
+    static bool isI64Slot(Type *Ty) { return Ty->isIntegerTy(64); }
+
+    static void declareSlot(SmallVectorImpl<std::string> &Declarations,
+                            const FunctionInfo::Slot &Slot) {
+      if (Slot.Ty->isIntegerTy(64)) {
+        appendI64Declarations(Declarations, Slot.I64);
+        return;
+      }
+
+      std::string Decl = "DCL     DD          " + Slot.Name;
+      if (Slot.Ty->isPointerTy())
+        Decl += "    BIN(4)     UNSGND;";
+      else
+        Decl += "    BIN(4);";
+      Declarations.push_back(std::move(Decl));
+    }
+
+    static FunctionInfo::Slot makeSlot(Type *Ty, StringRef Name) {
+      FunctionInfo::Slot Slot;
+      Slot.Ty = Ty;
+      Slot.Name = Name.str();
+      if (isI64Slot(Ty))
+        Slot.I64 = makeI64Value(Name);
+      return Slot;
     }
 
     void addMapRecord(const GeneratedName &Name, const Function &F,
@@ -1047,7 +1115,7 @@ class OS400MIEmitPass : public ModulePass {
       Info.F = &Main;
       Info.EntryName = "MAIN";
       Info.ReturnPointerName = ".MAIN";
-      Info.ReturnSlotName = "MAIN_RC";
+      Info.ReturnSlot = makeSlot(Main.getReturnType(), "MAIN_RC");
       Infos[&Main] = std::move(Info);
       MapRecords.push_back({"MAIN",
                             "function",
@@ -1071,17 +1139,17 @@ class OS400MIEmitPass : public ModulePass {
       Info.F = &F;
       Info.EntryName = Entry.Name;
       Info.ReturnPointerName = "." + Entry.Name;
-      Info.ReturnSlotName = Entry.Name + "R";
+      Info.ReturnSlot = makeSlot(F.getReturnType(), Entry.Name + "R");
       for (unsigned I = 0, E = F.arg_size(); I != E; ++I)
-        Info.ArgNames.push_back(formatv("{0}A{1}", Entry.Name, I + 1).str());
+        Info.Args.push_back(
+            makeSlot(F.getArg(I)->getType(),
+                     formatv("{0}A{1}", Entry.Name, I + 1).str()));
 
       Declarations.push_back("DCL     INSPTR      " + Info.ReturnPointerName +
                              ";");
-      Declarations.push_back("DCL     DD          " + Info.ReturnSlotName +
-                             "    BIN(4);");
-      for (StringRef ArgName : Info.ArgNames)
-        Declarations.push_back("DCL     DD          " + ArgName.str() +
-                               "    BIN(4);");
+      declareSlot(Declarations, Info.ReturnSlot);
+      for (const FunctionInfo::Slot &Arg : Info.Args)
+        declareSlot(Declarations, Arg);
 
       addMapRecord(Entry, F, "function");
       Infos[&F] = std::move(Info);
@@ -1102,8 +1170,8 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       if (!isSupportedCallType(Ty))
-        fail("non-varargs direct calls between functions returning i32 with "
-             "i32 arguments");
+        fail("non-varargs direct calls between functions using i32/i64/PTR32 "
+             "arguments and returns");
     }
 
     void visitFunction(const Function &F, bool IsMain) {
@@ -1254,6 +1322,30 @@ class OS400MIEmitPass : public ModulePass {
                             Size,
                             Alignment,
                             ""});
+    }
+
+    void addFrameMapRecord(uint32_t FrameOffset, uint32_t FrameSize) {
+      std::string Name = CurrentFunction->EntryName + "_FRAME";
+      if (Name.size() > NameAllocator::getMaxMINameLength())
+        fail("function frame map names no longer than 48 characters");
+      MapRecords.push_back({std::move(Name),
+                            "frame",
+                            "frame",
+                            CurrentFunction->F ? getOriginalName(
+                                                     *CurrentFunction->F)
+                                               : "",
+                            std::nullopt,
+                            std::nullopt,
+                            false,
+                            NameAllocator::getMaxMINameLength(),
+                            "",
+                            CurrentFunction->F
+                                ? getSourceLocation(*CurrentFunction->F)
+                                : std::nullopt,
+                            FrameOffset,
+                            FrameSize,
+                            4,
+                            "static-arena"});
     }
 
     std::string getOperandName(const Value *V) const {
@@ -3220,33 +3312,57 @@ class OS400MIEmitPass : public ModulePass {
         fail("defined internal callees; external calls require CALLX ABI");
 
       const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
-      if (!CB.getType()->isIntegerTy(32))
-        fail("direct i32 function call results");
-      if (CB.arg_size() != CalleeInfo.ArgNames.size())
+      if (!(CB.getType()->isIntegerTy(32) || CB.getType()->isIntegerTy(64) ||
+            CB.getType()->isPointerTy()))
+        fail("direct i32/i64/PTR32 function call results");
+      if (CB.arg_size() != CalleeInfo.Args.size())
         fail("direct function call arguments matching callee signature");
 
       for (unsigned I = 0, E = CB.arg_size(); I != E; ++I) {
         const Value *Arg = CB.getArgOperand(I);
-        if (!Arg->getType()->isIntegerTy(32))
-          fail("direct i32 function call arguments");
-        Body.push_back("        CPYNV       " + CalleeInfo.ArgNames[I] + "," +
+        const FunctionInfo::Slot &ArgSlot = CalleeInfo.Args[I];
+        if (ArgSlot.Ty != Arg->getType())
+          fail("direct function call arguments matching callee signature");
+
+        if (Arg->getType()->isIntegerTy(64)) {
+          Body.push_back("        CPYBLA      " + ArgSlot.I64.Bytes + "," +
+                         getI64Operand(Arg).Bytes + ";");
+          continue;
+        }
+
+        Body.push_back("        CPYNV       " + ArgSlot.Name + "," +
                        getOperandName(Arg) + ";");
       }
 
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
+      if (CB.getType()->isIntegerTy(64)) {
+        I64Value Dest = createI64Temp(CB, "call_result");
+        Body.push_back("        CPYBLA      " + Dest.Bytes + "," +
+                       CalleeInfo.ReturnSlot.I64.Bytes + ";");
+        I64Values[&CB] = Dest;
+        return;
+      }
+
       std::string Dest = createTemp(CB);
       Body.push_back("        CPYNV       " + Dest + "," +
-                     CalleeInfo.ReturnSlotName + ";");
+                     CalleeInfo.ReturnSlot.Name + ";");
       Values[&CB] = Dest;
     }
 
     void lowerReturn(const ReturnInst &RI) {
       Value *Ret = RI.getReturnValue();
-      if (!Ret || !isI32(Ret->getType()))
-        fail("i32 returns from lowered functions");
-      Body.push_back("        CPYNV       " + CurrentFunction->ReturnSlotName +
-                     "," + getOperandName(Ret) + ";");
+      if (!Ret || Ret->getType() != CurrentFunction->ReturnSlot.Ty)
+        fail("returns matching lowered function signature");
+      if (Ret->getType()->isIntegerTy(64)) {
+        Body.push_back("        CPYBLA      " +
+                       CurrentFunction->ReturnSlot.I64.Bytes + "," +
+                       getI64Operand(Ret).Bytes + ";");
+      } else {
+        Body.push_back("        CPYNV       " +
+                       CurrentFunction->ReturnSlot.Name + "," +
+                       getOperandName(Ret) + ";");
+      }
       Body.push_back("        B           " + CurrentFunction->ReturnPointerName +
                      ";");
     }
@@ -3315,11 +3431,16 @@ class OS400MIEmitPass : public ModulePass {
 
       Body.push_back("ENTRY " + CurrentFunction->EntryName + " INT;");
 
+      uint32_t FrameOffset = NextArenaOffset;
       unsigned ArgIndex = 0;
       for (const Argument &Arg : F.args()) {
-        if (!Arg.getType()->isIntegerTy(32))
-          fail("i32 function arguments");
-        Values[&Arg] = CurrentFunction->ArgNames[ArgIndex++];
+        const FunctionInfo::Slot &ArgSlot = CurrentFunction->Args[ArgIndex++];
+        if (Arg.getType() != ArgSlot.Ty)
+          fail("function arguments matching lowered function signature");
+        if (Arg.getType()->isIntegerTy(64))
+          I64Values[&Arg] = ArgSlot.I64;
+        else
+          Values[&Arg] = ArgSlot.Name;
       }
 
       for (const BasicBlock &BB : F) {
@@ -3402,6 +3523,8 @@ class OS400MIEmitPass : public ModulePass {
 
       for (const std::string &Line : EdgeBlocks)
         Body.push_back(Line);
+
+      addFrameMapRecord(FrameOffset, NextArenaOffset - FrameOffset);
     }
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }

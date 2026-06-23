@@ -1027,6 +1027,8 @@ class OS400MIEmitPass : public ModulePass {
       Type *Ty = nullptr;
       std::string Name;
       I64Value I64;
+      uint32_t Size = 0;
+      uint32_t Alignment = 0;
     };
 
     const Function *F = nullptr;
@@ -1053,7 +1055,8 @@ class OS400MIEmitPass : public ModulePass {
     static bool isSupportedCallABIType(Type *Ty) {
       return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
              Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
-             Ty->isIntegerTy(64) || Ty->isPointerTy();
+             Ty->isIntegerTy(64) || Ty->isPointerTy() ||
+             isSupportedArenaValueType(Ty);
     }
 
     static bool isSupportedCallType(const FunctionType *Ty) {
@@ -1070,11 +1073,23 @@ class OS400MIEmitPass : public ModulePass {
     static bool isNarrowIntSlot(Type *Ty) {
       return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) || Ty->isIntegerTy(16);
     }
+    static bool isAggregateSlot(Type *Ty) {
+      return !(Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+               Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+               Ty->isIntegerTy(64) || Ty->isPointerTy());
+    }
 
     static void declareSlot(SmallVectorImpl<std::string> &Declarations,
                             const FunctionInfo::Slot &Slot) {
       if (Slot.Ty->isIntegerTy(64)) {
         appendI64Declarations(Declarations, Slot.I64);
+        return;
+      }
+
+      if (isAggregateSlot(Slot.Ty)) {
+        Declarations.push_back("DCL     DD          " + Slot.Name +
+                               "    CHAR(" + std::to_string(Slot.Size) +
+                               ");");
         return;
       }
 
@@ -1090,12 +1105,20 @@ class OS400MIEmitPass : public ModulePass {
                                ") POS(1);");
     }
 
-    static FunctionInfo::Slot makeSlot(Type *Ty, StringRef Name) {
+    static FunctionInfo::Slot makeSlot(const DataLayout &DL, Type *Ty,
+                                       StringRef Name) {
       FunctionInfo::Slot Slot;
       Slot.Ty = Ty;
       Slot.Name = Name.str();
       if (isI64Slot(Ty))
         Slot.I64 = makeI64Value(Name);
+      if (isAggregateSlot(Ty)) {
+        uint64_t Size = DL.getTypeAllocSize(Ty);
+        if (Size > std::numeric_limits<uint32_t>::max())
+          fail("aggregate call slots no larger than 4 GiB");
+        Slot.Size = static_cast<uint32_t>(Size);
+        Slot.Alignment = getABIAlignment(DL, Ty);
+      }
       return Slot;
     }
 
@@ -1124,7 +1147,9 @@ class OS400MIEmitPass : public ModulePass {
       Info.F = &Main;
       Info.EntryName = "MAIN";
       Info.ReturnPointerName = ".MAIN";
-      Info.ReturnSlot = makeSlot(Main.getReturnType(), "MAIN_RC");
+      Info.ReturnSlot =
+          makeSlot(Main.getParent()->getDataLayout(), Main.getReturnType(),
+                   "MAIN_RC");
       Infos[&Main] = std::move(Info);
       MapRecords.push_back({"MAIN",
                             "function",
@@ -1143,15 +1168,16 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void createHelperInfo(const Function &F) {
+      const DataLayout &DL = F.getParent()->getDataLayout();
       GeneratedName Entry = Names.createFunctionName(getOriginalName(F));
       FunctionInfo Info;
       Info.F = &F;
       Info.EntryName = Entry.Name;
       Info.ReturnPointerName = "." + Entry.Name;
-      Info.ReturnSlot = makeSlot(F.getReturnType(), Entry.Name + "R");
+      Info.ReturnSlot = makeSlot(DL, F.getReturnType(), Entry.Name + "R");
       for (unsigned I = 0, E = F.arg_size(); I != E; ++I)
         Info.Args.push_back(
-            makeSlot(F.getArg(I)->getType(),
+            makeSlot(DL, F.getArg(I)->getType(),
                      formatv("{0}A{1}", Entry.Name, I + 1).str()));
 
       Declarations.push_back("DCL     INSPTR      " + Info.ReturnPointerName +
@@ -1295,6 +1321,13 @@ class OS400MIEmitPass : public ModulePass {
       return Ty && (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
                     Ty->isIntegerTy(32) || Ty->isIntegerTy(64) ||
                     Ty->isPointerTy());
+    }
+
+    static bool isAggregateABIType(Type *Ty) {
+      return Ty && !(Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+                     Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+                     Ty->isIntegerTy(64) || Ty->isPointerTy()) &&
+             isSupportedArenaValueType(Ty);
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
@@ -2823,6 +2856,26 @@ class OS400MIEmitPass : public ModulePass {
       return Bytes;
     }
 
+    void copyAggregateValueToName(const Value *V, StringRef Dest) {
+      if (!isAggregateABIType(V->getType()))
+        fail("aggregate call ABI values");
+
+      if (auto AggIt = AggregateValues.find(V); AggIt != AggregateValues.end()) {
+        Body.push_back("        CPYBLA      " + Dest.str() + "," +
+                       AggIt->second.Name + ";");
+        return;
+      }
+
+      if (std::optional<SmallVector<uint8_t, 32>> Bytes =
+              getConstantStoreBytes(V)) {
+        Body.push_back("        CPYBLA      " + Dest.str() + ",X'" +
+                       getRawHex(*Bytes) + "';");
+        return;
+      }
+
+      fail("aggregate call values from constants, loads, or insertvalue");
+    }
+
     void emitStoreByteToPointer(StringRef PtrOffset, uint64_t ByteOffset,
                                 uint8_t Byte) {
       emitSetLensPointerFromOffset(getPointerOffsetPlus(PtrOffset, ByteOffset));
@@ -3330,8 +3383,9 @@ class OS400MIEmitPass : public ModulePass {
       const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
       if (!(CB.getType()->isIntegerTy(1) || CB.getType()->isIntegerTy(8) ||
             CB.getType()->isIntegerTy(16) || CB.getType()->isIntegerTy(32) ||
-            CB.getType()->isIntegerTy(64) || CB.getType()->isPointerTy()))
-        fail("direct i1/i8/i16/i32/i64/PTR32 function call results");
+            CB.getType()->isIntegerTy(64) || CB.getType()->isPointerTy() ||
+            isAggregateABIType(CB.getType())))
+        fail("direct i1/i8/i16/i32/i64/PTR32/aggregate function call results");
       if (CB.arg_size() != CalleeInfo.Args.size())
         fail("direct function call arguments matching callee signature");
 
@@ -3344,6 +3398,11 @@ class OS400MIEmitPass : public ModulePass {
         if (Arg->getType()->isIntegerTy(64)) {
           Body.push_back("        CPYBLA      " + ArgSlot.I64.Bytes + "," +
                          getI64Operand(Arg).Bytes + ";");
+          continue;
+        }
+
+        if (isAggregateABIType(Arg->getType())) {
+          copyAggregateValueToName(Arg, ArgSlot.Name);
           continue;
         }
 
@@ -3362,6 +3421,14 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
+      if (isAggregateABIType(CB.getType())) {
+        ArenaSlot Dest = createAggregateTemp(CB, CB.getType(), "call_result");
+        Body.push_back("        CPYBLA      " + Dest.Name + "," +
+                       CalleeInfo.ReturnSlot.Name + ";");
+        AggregateValues[&CB] = Dest;
+        return;
+      }
+
       std::string Dest = createTemp(CB);
       Body.push_back("        CPYNV       " + Dest + "," +
                      CalleeInfo.ReturnSlot.Name + ";");
@@ -3377,6 +3444,8 @@ class OS400MIEmitPass : public ModulePass {
         Body.push_back("        CPYBLA      " +
                        CurrentFunction->ReturnSlot.I64.Bytes + "," +
                        getI64Operand(Ret).Bytes + ";");
+      } else if (isAggregateABIType(Ret->getType())) {
+        copyAggregateValueToName(Ret, CurrentFunction->ReturnSlot.Name);
       } else {
         Body.push_back("        CPYNV       " +
                        CurrentFunction->ReturnSlot.Name + "," +
@@ -3458,9 +3527,15 @@ class OS400MIEmitPass : public ModulePass {
         const FunctionInfo::Slot &ArgSlot = CurrentFunction->Args[ArgIndex++];
         if (Arg.getType() != ArgSlot.Ty)
           fail("function arguments matching lowered function signature");
-        if (Arg.getType()->isIntegerTy(64))
+        if (Arg.getType()->isIntegerTy(64)) {
           I64Values[&Arg] = ArgSlot.I64;
-        else {
+        } else if (isAggregateABIType(Arg.getType())) {
+          ArenaSlot Slot =
+              createAggregateTemp(Arg, Arg.getType(), "aggregate_arg");
+          Body.push_back("        CPYBLA      " + Slot.Name + "," +
+                         ArgSlot.Name + ";");
+          AggregateValues[&Arg] = Slot;
+        } else {
           maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
           Values[&Arg] = ArgSlot.Name;
         }

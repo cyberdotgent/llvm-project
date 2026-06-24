@@ -10,7 +10,7 @@ void f(const char *s) {
       __builtin_os400mi_ufcb_library(ufcb), 10, "*LIBL");
   __builtin_os400mi_char_from_cstr_blank_padded(
       __builtin_os400mi_ufcb_member(ufcb), 10, "*FIRST");
-  spcptr open = __builtin_os400mi_sysptr_sept(12);
+  spcptr open = __builtin_os400mi_sysptr_program("QSYS", "QDMCOPEN");
   __builtin_os400mi_callx1(open, ufcb);
   spcptr out = __builtin_os400mi_ufcb_outbuf(ufcb);
   __builtin_os400mi_char_fill(out, 132, ' ');
@@ -41,7 +41,7 @@ void f(const char *s) {
 // CHECK: call void @llvm.os400mi.char.from.cstr.blank.padded(ptr {{.*}}, i32 10, ptr {{.*}})
 // CHECK: call ptr @llvm.os400mi.ufcb.member(ptr {{.*}})
 // CHECK: call void @llvm.os400mi.char.from.cstr.blank.padded(ptr {{.*}}, i32 10, ptr {{.*}})
-// CHECK: call ptr @llvm.os400mi.sysptr.sept(i16 12)
+// CHECK: call ptr @llvm.os400mi.sysptr.program(ptr {{.*}}, ptr {{.*}})
 // CHECK: call void @llvm.os400mi.callx.1(ptr {{.*}}, ptr {{.*}})
 // CHECK: call ptr @llvm.os400mi.ufcb.outbuf(ptr {{.*}})
 // CHECK: call void @llvm.os400mi.char.fill(ptr {{.*}}, i32 132, i32 32)

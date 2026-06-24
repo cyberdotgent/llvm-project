@@ -4,6 +4,9 @@
 @file = internal constant [8 x i8] c"QSYSPRT\00"
 @library = internal constant [6 x i8] c"*LIBL\00"
 @member = internal constant [7 x i8] c"*FIRST\00"
+@qsys = internal constant [5 x i8] c"QSYS\00"
+@qdmopen = internal constant [9 x i8] c"QDMCOPEN\00"
+@qdmclose = internal constant [9 x i8] c"QDMCLOSE\00"
 
 define i32 @main() {
 entry:
@@ -14,7 +17,7 @@ entry:
   call void @llvm.os400mi.char.from.cstr.blank.padded(ptr %libraryp, i32 10, ptr @library)
   %memberp = call ptr @llvm.os400mi.ufcb.member(ptr %ufcb)
   call void @llvm.os400mi.char.from.cstr.blank.padded(ptr %memberp, i32 10, ptr @member)
-  %open = call ptr @llvm.os400mi.sysptr.sept(i16 12)
+  %open = call ptr @llvm.os400mi.sysptr.program(ptr @qsys, ptr @qdmopen)
   call void @llvm.os400mi.callx.1(ptr %open, ptr %ufcb)
   %out = call ptr @llvm.os400mi.ufcb.outbuf(ptr %ufcb)
   call void @llvm.os400mi.char.fill(ptr %out, i32 132, i32 32)
@@ -25,7 +28,7 @@ entry:
   %opt = call ptr @llvm.os400mi.dm.put.wait.option()
   %null = call ptr @llvm.os400mi.spcptr.null()
   call void @llvm.os400mi.callx.3(ptr %put, ptr %ufcb, ptr %opt, ptr %null)
-  %close = call ptr @llvm.os400mi.sysptr.sept(i16 11)
+  %close = call ptr @llvm.os400mi.sysptr.program(ptr @qsys, ptr @qdmclose)
   call void @llvm.os400mi.callx.1(ptr %close, ptr %ufcb)
   ret i32 0
 }
@@ -35,6 +38,7 @@ declare ptr @llvm.os400mi.ufcb.file(ptr)
 declare ptr @llvm.os400mi.ufcb.library(ptr)
 declare ptr @llvm.os400mi.ufcb.member(ptr)
 declare ptr @llvm.os400mi.sysptr.sept(i16)
+declare ptr @llvm.os400mi.sysptr.program(ptr, ptr)
 declare void @llvm.os400mi.callx.1(ptr, ptr)
 declare ptr @llvm.os400mi.ufcb.outbuf(ptr)
 declare void @llvm.os400mi.char.fill(ptr, i32, i32)
@@ -48,6 +52,8 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 
 ; CHECK-DAG: DCL     SPCPTR      @SEPT     BASPCO;
 ; CHECK-DAG: DCL     SPCPTR      .OFCB     INIT(OFCB);
+; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCOPEN", CTX("QSYS"), TYPE(PGM));
+; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCLOSE", CTX("QSYS"), TYPE(PGM));
 ; CHECK-DAG: DCL     DD          OFCB-FILE    CHAR(10) DEF(OFCB) POS(129);
 ; CHECK-DAG: DCL     DD          OFCB-LIBRARY CHAR(10) DEF(OFCB) POS(141);
 ; CHECK-DAG: DCL     DD          OFCB-MEMBER  CHAR(10) DEF(OFCB) POS(153);
@@ -56,9 +62,9 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 ; CHECK-NOT: INIT("QSYSPRT")
 ; CHECK-NOT: INIT("*LIBL")
 ; CHECK-NOT: INIT("*FIRST")
-; CHECK: CALLX       .SEPT(12),{{[^,]+}},*;
+; CHECK: CALLX       .{{[A-Z0-9]+}},{{[^,]+}},*;
 ; CHECK: CPYBREP     OUTBUF," ";
 ; CHECK: CMPBLA(B)   LS_I1,X'00'/EQ(
 ; CHECK: CPYBLA      NCHAR,LS_I1;
 ; CHECK: CALLX       .SEPT(PUT-ENTRY),{{[^,]+}},*;
-; CHECK: CALLX       .SEPT(11),{{[^,]+}},*;
+; CHECK: CALLX       .{{[A-Z0-9]+}},{{[^,]+}},*;

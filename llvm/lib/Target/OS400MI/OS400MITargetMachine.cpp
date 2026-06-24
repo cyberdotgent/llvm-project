@@ -52,6 +52,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1462,6 +1463,7 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<std::string, 16> Body;
     SmallVector<std::string, 16> EdgeBlocks;
     SmallVector<MapRecord, 16> MapRecords;
+    std::map<std::string, std::string> ProgramSysptrCache;
     uint32_t NextArenaOffset;
     uint32_t NextCallBarrier = 1;
     bool HasLoadStoreLens = false;
@@ -1976,6 +1978,11 @@ class OS400MIEmitPass : public ModulePass {
       if (!isValidOS400ObjectName(*Library, /*AllowSpecial=*/true))
         fail("OS/400 library names of 1..10 uppercase name characters");
 
+      std::string Key = *Library + "/" + *Program;
+      auto Cached = ProgramSysptrCache.find(Key);
+      if (Cached != ProgramSysptrCache.end())
+        return Cached->second;
+
       GeneratedName Name = Names.createTempName(*Program);
       std::string NativeName = "." + Name.Name;
       std::string Decl =
@@ -1986,8 +1993,9 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back(std::move(Decl));
       addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
                     Name.Collision, Name.Hash},
-                   "native_program_sysptr", *Library + "/" + *Program,
+                   "native_program_sysptr", Key,
                    std::nullopt, std::nullopt, 16, 16);
+      ProgramSysptrCache[std::move(Key)] = NativeName;
       return NativeName;
     }
 

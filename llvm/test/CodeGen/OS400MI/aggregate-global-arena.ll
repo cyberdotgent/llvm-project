@@ -15,9 +15,13 @@ entry:
   %bv = load i8, ptr %bp
   %pp = getelementptr { i8, i16, i32 }, ptr @pair, i32 0, i32 1
   %pv = load i16, ptr %pp
+  %zp0 = getelementptr [2 x i16], ptr @zeros, i32 0, i32 0
+  %z0 = load i16, ptr %zp0
   %zv = zext i8 %bv to i32
   %zp = zext i16 %pv to i32
-  %sum = add i32 %zv, %zp
+  %zz = zext i16 %z0 to i32
+  %sum0 = add i32 %zv, %zp
+  %sum = add i32 %sum0, %zz
   ret i32 %sum
 }
 

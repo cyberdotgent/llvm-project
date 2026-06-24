@@ -816,6 +816,8 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<std::string, 8> Declarations;
     SmallVector<MapRecord, 8> MapRecords;
     uint32_t NextArenaOffset = FirstArenaOffset;
+    std::set<const GlobalVariable *> LaidOutGlobals;
+    std::set<const GlobalVariable *> VisitingGlobals;
 
     static uint32_t alignTo(uint32_t Value, uint32_t Alignment) {
       return (Value + Alignment - 1) & ~(Alignment - 1);
@@ -1034,12 +1036,13 @@ class OS400MIEmitPass : public ModulePass {
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
-      Declarations.push_back("DCL     DD          " + Name.Name +
-                             "    BIN(4)     UNSGND DEF(C_MEM) POS(" +
-                             std::to_string(Offset + 1) + ") INIT(" +
-                             std::to_string(*PointerValue) + ");");
+      SmallVector<uint8_t, 4> Bytes(Size, 0);
+      storeIntegerBytes(APInt(32, *PointerValue), Size, Bytes);
+      Declarations.push_back("DCL DD " + Name.Name + " CHAR(4) DEF(C_MEM) POS(" +
+                             std::to_string(Offset + 1) + ") INIT(X'" +
+                             getRawHex(Bytes) + "');");
       addGlobalObject(GV, Name, "ptr_global", Offset, Size, Alignment,
-                      AccessWidth::I32, true);
+                      AccessWidth::I32, false);
       addMapRecord(Name, "ptr_global", std::move(Original), Offset, Size,
                    Alignment, getSourceLocation(GV), "ptr32");
       NextArenaOffset = Offset + Size;
@@ -1099,48 +1102,116 @@ class OS400MIEmitPass : public ModulePass {
       NextArenaOffset = Offset + Size;
     }
 
-  public:
-    explicit ArenaLayout(const DataLayout &DL, NameAllocator &Names)
-        : Names(Names), DL(DL) {}
+    void collectGlobalRefs(const Value *V,
+                           std::set<const GlobalVariable *> &Reachable) const {
+      if (!V)
+        return;
 
-    void lower(const Module &M) {
-      for (const GlobalVariable &GV : M.globals()) {
-        if (isSpecialLLVMGlobal(GV))
-          continue;
+      V = V->stripPointerCasts();
+      if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+        if (!isSpecialLLVMGlobal(*GV))
+          Reachable.insert(GV);
+        return;
+      }
 
-        if (GV.isDeclaration())
-          fail("defined globals only");
+      if (const auto *C = dyn_cast<Constant>(V)) {
+        if (const auto *GEP = dyn_cast<GEPOperator>(C))
+          collectGlobalRefs(GEP->getPointerOperand(), Reachable);
+        for (const Use &Op : C->operands())
+          collectGlobalRefs(Op.get(), Reachable);
+      }
+    }
 
-        Type *ValueTy = GV.getValueType();
-        if (ValueTy->isIntegerTy(8) || ValueTy->isIntegerTy(16) ||
-            ValueTy->isIntegerTy(32) || ValueTy->isIntegerTy(64)) {
-          layoutIntegerGlobal(GV);
-          continue;
-        }
+    void collectGlobalRefs(const Function &F,
+                           std::set<const GlobalVariable *> &Reachable) const {
+      for (const BasicBlock &BB : F)
+        for (const Instruction &I : BB)
+          for (const Use &Op : I.operands())
+            collectGlobalRefs(Op.get(), Reachable);
+    }
 
-        if (ValueTy->isPointerTy()) {
-          layoutPointerGlobal(GV);
-          continue;
-        }
+    void collectInitializerRefs(
+        const GlobalVariable &GV,
+        std::set<const GlobalVariable *> &Reachable) const {
+      if (!GV.hasInitializer())
+        return;
+      size_t OldSize = 0;
+      do {
+        OldSize = Reachable.size();
+        collectGlobalRefs(GV.getInitializer(), Reachable);
+      } while (Reachable.size() != OldSize);
+    }
 
+    void layoutGlobal(const GlobalVariable &GV,
+                      const std::set<const GlobalVariable *> &Reachable) {
+      if (LaidOutGlobals.count(&GV))
+        return;
+      if (VisitingGlobals.count(&GV))
+        fail("acyclic reachable global initializer references");
+      if (!Reachable.count(&GV))
+        return;
+
+      if (isSpecialLLVMGlobal(GV))
+        return;
+      if (GV.isDeclaration())
+        fail("defined globals only");
+
+      VisitingGlobals.insert(&GV);
+      std::set<const GlobalVariable *> Dependencies;
+      collectInitializerRefs(GV, Dependencies);
+      for (const GlobalVariable *Dependency : Dependencies) {
+        if (Dependency != &GV)
+          layoutGlobal(*Dependency, Reachable);
+      }
+
+      Type *ValueTy = GV.getValueType();
+      if (ValueTy->isIntegerTy(8) || ValueTy->isIntegerTy(16) ||
+          ValueTy->isIntegerTy(32) || ValueTy->isIntegerTy(64)) {
+        layoutIntegerGlobal(GV);
+      } else if (ValueTy->isPointerTy()) {
+        layoutPointerGlobal(GV);
+      } else {
         const auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
         const auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
         if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA &&
             isEBCDICStringLiteral(*CDA, DefaultEBCDICCodePage)) {
           layoutStringGlobal(GV, *CDA);
-          continue;
-        }
-
-        if (isa<ConstantAggregateZero>(GV.getInitializer()) ||
-            isa<ConstantArray>(GV.getInitializer()) ||
-            isa<ConstantStruct>(GV.getInitializer()) ||
-            isa<ConstantDataArray>(GV.getInitializer())) {
+        } else if (isa<ConstantAggregateZero>(GV.getInitializer()) ||
+                   isa<ConstantArray>(GV.getInitializer()) ||
+                   isa<ConstantStruct>(GV.getInitializer()) ||
+                   isa<ConstantDataArray>(GV.getInitializer())) {
           layoutAggregateGlobal(GV);
-          continue;
+        } else {
+          fail("i8/i16/i32/i64/PTR32 globals, constant i8 string globals, and "
+               "integer/PTR32 array/struct globals");
         }
+      }
 
-        fail("i8/i16/i32/i64/PTR32 globals, constant i8 string globals, and "
-             "integer/PTR32 array/struct globals");
+      VisitingGlobals.erase(&GV);
+      LaidOutGlobals.insert(&GV);
+    }
+
+  public:
+    explicit ArenaLayout(const DataLayout &DL, NameAllocator &Names)
+        : Names(Names), DL(DL) {}
+
+    void lower(const Module &M, ArrayRef<const Function *> Functions) {
+      std::set<const GlobalVariable *> Reachable;
+      for (const Function *F : Functions)
+        collectGlobalRefs(*F, Reachable);
+
+      size_t OldSize = 0;
+      do {
+        OldSize = Reachable.size();
+        SmallVector<const GlobalVariable *, 16> Snapshot(Reachable.begin(),
+                                                        Reachable.end());
+        for (const GlobalVariable *GV : Snapshot)
+          collectInitializerRefs(*GV, Reachable);
+      } while (Reachable.size() != OldSize);
+
+      for (const GlobalVariable &GV : M.globals()) {
+        if (Reachable.count(&GV))
+          layoutGlobal(GV, Reachable);
       }
     }
 
@@ -1188,11 +1259,18 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<Slot, 4> Args;
   };
 
+  struct CtorDtorEntry {
+    uint32_t Priority = 0;
+    const Function *F = nullptr;
+  };
+
   class ModuleFunctionPlan {
     NameAllocator &Names;
     SmallVector<const Function *, 8> Functions;
     DenseMap<const Function *, FunctionInfo> Infos;
     DenseMap<const Function *, unsigned> VisitState;
+    SmallVector<CtorDtorEntry, 4> Constructors;
+    SmallVector<CtorDtorEntry, 4> Destructors;
     SmallVector<std::string, 8> Declarations;
     SmallVector<MapRecord, 8> MapRecords;
 
@@ -1422,6 +1500,48 @@ class OS400MIEmitPass : public ModulePass {
       State = 2;
     }
 
+    static const Function *getCtorDtorFunction(const Constant *C) {
+      if (isa<ConstantPointerNull>(C))
+        return nullptr;
+      return dyn_cast<Function>(C->stripPointerCasts());
+    }
+
+    void collectCtorDtorList(const Module &M, StringRef Name,
+                             SmallVectorImpl<CtorDtorEntry> &Entries) {
+      const GlobalVariable *GV = M.getNamedGlobal(Name);
+      if (!GV)
+        return;
+      if (!GV->hasInitializer())
+        fail(Name + " with an initializer");
+
+      const Constant *Init = GV->getInitializer();
+      auto *ArrayTy = dyn_cast<ArrayType>(Init->getType());
+      if (!ArrayTy)
+        fail(Name + " as an array of ctor/dtor records");
+
+      for (unsigned I = 0, E = ArrayTy->getNumElements(); I != E; ++I) {
+        const Constant *Record = Init->getAggregateElement(I);
+        if (!Record)
+          fail(Name + " records");
+
+        const auto *Priority =
+            dyn_cast_or_null<ConstantInt>(Record->getAggregateElement(0U));
+        const Function *F =
+            getCtorDtorFunction(Record->getAggregateElement(1U));
+        if (!Priority)
+          fail(Name + " records with integer priorities");
+        if (!F)
+          continue;
+        if (F->isDeclaration())
+          fail(Name + " functions defined in linked bitcode");
+        FunctionType *Ty = F->getFunctionType();
+        if (!Ty->getReturnType()->isVoidTy() || Ty->getNumParams() != 0)
+          fail(Name + " functions with void(void) signature");
+        Entries.push_back(
+            {static_cast<uint32_t>(Priority->getZExtValue()), F});
+      }
+    }
+
   public:
     explicit ModuleFunctionPlan(NameAllocator &Names) : Names(Names) {}
 
@@ -1434,6 +1554,21 @@ class OS400MIEmitPass : public ModulePass {
 
       createEntryInfo(*Entry);
       visitFunction(*Entry, true);
+
+      collectCtorDtorList(M, "llvm.global_ctors", Constructors);
+      collectCtorDtorList(M, "llvm.global_dtors", Destructors);
+      llvm::stable_sort(Constructors, [](const CtorDtorEntry &LHS,
+                                         const CtorDtorEntry &RHS) {
+        return LHS.Priority < RHS.Priority;
+      });
+      llvm::stable_sort(Destructors, [](const CtorDtorEntry &LHS,
+                                        const CtorDtorEntry &RHS) {
+        return LHS.Priority > RHS.Priority;
+      });
+      for (const CtorDtorEntry &Entry : Constructors)
+        visitFunction(*Entry.F, false);
+      for (const CtorDtorEntry &Entry : Destructors)
+        visitFunction(*Entry.F, false);
 
       // Whole-program hosted links can leave unused definitions from selected
       // bitcode archive members.  Lower only the program slice reachable from
@@ -1448,6 +1583,8 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     ArrayRef<const Function *> getFunctions() const { return Functions; }
+    ArrayRef<CtorDtorEntry> getConstructors() const { return Constructors; }
+    ArrayRef<CtorDtorEntry> getDestructors() const { return Destructors; }
 
     const FunctionInfo &getInfo(const Function &F) const {
       auto It = Infos.find(&F);
@@ -3672,11 +3809,15 @@ class OS400MIEmitPass : public ModulePass {
       if (Name == "llvm.os400mi.runtime.startup") {
         if (CB.arg_size() != 0 || !CB.getType()->isVoidTy())
           fail("OS400MI runtime_startup builtin signature");
+        for (const CtorDtorEntry &Entry : FunctionPlan.getConstructors())
+          emitDirectCall(*Entry.F);
         return true;
       }
       if (Name == "llvm.os400mi.runtime.terminate") {
         if (CB.arg_size() != 1 || !CB.getType()->isIntegerTy(32))
           fail("OS400MI runtime_terminate builtin signature");
+        for (const CtorDtorEntry &Entry : FunctionPlan.getDestructors())
+          emitDirectCall(*Entry.F);
         Values[&CB] = getOperandName(CB.getArgOperand(0));
         return true;
       }
@@ -4100,10 +4241,10 @@ class OS400MIEmitPass : public ModulePass {
       AccessWidth Width = getAccessWidth(ValueTy);
       if (std::optional<ArenaSlot> Slot =
               getDirectScalarSlot(SI.getPointerOperand())) {
-        if (Slot->Width != Width)
-          fail("stores matching direct scalar slot width");
-        emitStoreToReference(Slot->Name, Width, SI.getValueOperand());
-        return;
+        if (Slot->Width == Width) {
+          emitStoreToReference(Slot->Name, Width, SI.getValueOperand());
+          return;
+        }
       }
 
       emitSetLensPointer(SI.getPointerOperand());
@@ -4154,11 +4295,11 @@ class OS400MIEmitPass : public ModulePass {
       std::string Dest = createTemp(LI);
       if (std::optional<ArenaSlot> Slot =
               getDirectScalarSlot(LI.getPointerOperand())) {
-        if (Slot->Width != Width)
-          fail("loads matching direct scalar slot width");
-        emitLoadFromReference(Dest, Slot->Name, Width);
-        Values[&LI] = Dest;
-        return;
+        if (Slot->Width == Width) {
+          emitLoadFromReference(Dest, Slot->Name, Width);
+          Values[&LI] = Dest;
+          return;
+        }
       }
 
       emitSetLensPointer(LI.getPointerOperand());
@@ -4521,6 +4662,16 @@ class OS400MIEmitPass : public ModulePass {
                      CalleeInfo.ReturnSlot.Name + ";");
       maskIntegerSlotToType(Dest, CB.getType());
       Values[&CB] = Dest;
+    }
+
+    void emitDirectCall(const Function &Callee) {
+      const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(Callee);
+      if (!CalleeInfo.Args.empty())
+        fail("runtime ctor/dtor calls with no arguments");
+      if (!Callee.getReturnType()->isVoidTy())
+        fail("runtime ctor/dtor calls returning void");
+      Body.push_back("        CALLI       " + CalleeInfo.EntryName +
+                     ", *, " + CalleeInfo.ReturnPointerName + ";");
     }
 
     void lowerReturn(const ReturnInst &RI) {
@@ -4921,7 +5072,7 @@ public:
     FunctionPlan.analyze(M);
 
     ArenaLayout Layout(M.getDataLayout(), Names);
-    Layout.lower(M);
+    Layout.lower(M, FunctionPlan.getFunctions());
     FunctionLowerer Lowerer(M.getDataLayout(), Layout, FunctionPlan, Names);
     for (const Function *F : FunctionPlan.getFunctions())
       Lowerer.lower(*F);

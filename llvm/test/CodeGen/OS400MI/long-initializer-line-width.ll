@@ -9,7 +9,9 @@ target triple = "os400mi-ibm-os400"
 
 define i32 @main() {
 entry:
-  ret i32 0
+  %p = ptrtoint ptr @.str to i32
+  %low = and i32 %p, 3
+  ret i32 %low
 }
 
 ; CHECK: DCL     DD          L000001    CHAR(38)    DEF(C_MEM) POS(5);

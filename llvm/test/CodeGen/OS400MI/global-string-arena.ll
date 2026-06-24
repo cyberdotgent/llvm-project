@@ -12,14 +12,17 @@ target triple = "os400mi-ibm-os400"
 define i32 @main() {
 entry:
   %v = load i32, ptr @g
-  ret i32 %v
+  %p = ptrtoint ptr @.str to i32
+  %low = and i32 %p, 3
+  %sum = add i32 %v, %low
+  ret i32 %sum
 }
 
 ; MI: DCL     DD          C_MEM      CHAR(256) BDRY(16);
 ; MI: DCL     DD          G000001    BIN(4)     DEF(C_MEM) POS(5) INIT(7);
 ; MI: DCL     DD          L000001    CHAR(3)    DEF(C_MEM) POS(9);
 ; MI-NEXT: DCL DD H000001 CHAR(3) DEF(L000001) POS(1) INIT(X'C88900');
-; MI: CPYNV       T000001,G000001;
+; MI: CPYNV       {{T[0-9]+}},G000001;
 
 ; MAP: {"mi_name":"C_MEM","kind":"arena","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
 ; MAP-NEXT: {"mi_name":"C_STACK","kind":"stack","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
@@ -29,4 +32,4 @@ entry:
 ; MAP-NEXT: {"mi_name":"L000001","kind":"string","name_class":"literal","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":".str","arena_offset":8,"size":3,"alignment":1,"encoding":"ibm-037"}
 ; MAP-NEXT: {"mi_name":"H000001","kind":"initializer_chunk","name_class":"helper","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"L000001","arena_offset":8,"size":3,"alignment":1,"encoding":"ibm-037"}
 ; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","name_class":"label","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"entry"}
-; MAP-NEXT: {"mi_name":"T000001","kind":"temp","name_class":"temp","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"v","size":4,"alignment":4}
+; MAP: {"mi_name":"T{{[0-9]+}}","kind":"temp","name_class":"temp","name_ordinal":{{[0-9]+}},"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"v","size":4,"alignment":4}

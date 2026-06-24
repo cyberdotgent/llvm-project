@@ -14,12 +14,49 @@
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/InputInfo.h"
 #include "clang/Options/Options.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
 using namespace clang::driver;
 using namespace clang::driver::toolchains;
 using namespace clang::driver::tools;
 using namespace llvm::opt;
+
+static std::string getOS400MIArchiveName(llvm::StringRef LibName) {
+  llvm::SmallString<128> FileName;
+  if (LibName.starts_with(":")) {
+    FileName = LibName.drop_front();
+  } else {
+    FileName = "lib";
+    FileName += LibName;
+    FileName += ".a";
+  }
+  return FileName.str().str();
+}
+
+static std::optional<std::string> findOS400MIArchive(const ToolChain &TC,
+                                                     const ArgList &Args,
+                                                     llvm::StringRef LibName) {
+  llvm::SmallVector<std::string, 8> SearchPaths;
+  for (std::string Path : Args.getAllArgValues(clang::options::OPT_L))
+    SearchPaths.push_back(std::move(Path));
+  for (llvm::StringRef Path : TC.getFilePaths())
+    SearchPaths.push_back(Path.str());
+
+  std::string FileName = getOS400MIArchiveName(LibName);
+
+  for (llvm::StringRef SearchPath : SearchPaths) {
+    llvm::SmallString<256> Candidate(SearchPath);
+    llvm::sys::path::append(Candidate, FileName);
+    if (llvm::sys::fs::exists(Candidate))
+      return std::string(Candidate);
+  }
+
+  if (llvm::sys::fs::exists(FileName))
+    return std::string(FileName);
+  return std::nullopt;
+}
 
 void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                    const InputInfo &Output,
@@ -35,9 +72,21 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
       continue;
     }
 
-    if (Input.isInputArg())
-      C.getDriver().Diag(diag::err_drv_unsupported_opt)
-          << Input.getInputArg().getAsString(Args);
+    if (Input.isInputArg()) {
+      if (Input.getInputArg().getOption().matches(options::OPT_l)) {
+        llvm::StringRef LibName = Input.getInputArg().getValue();
+        if (std::optional<std::string> Archive =
+                findOS400MIArchive(getToolChain(), Args, LibName)) {
+          LinkArgs.push_back(Args.MakeArgString(*Archive));
+          continue;
+        }
+        C.getDriver().Diag(diag::err_drv_no_such_file)
+            << Args.MakeArgString(getOS400MIArchiveName(LibName));
+      } else {
+        C.getDriver().Diag(diag::err_drv_unsupported_opt)
+            << Input.getInputArg().getAsString(Args);
+      }
+    }
   }
 
   if (LinkArgs.empty())

@@ -1721,7 +1721,6 @@ class OS400MIEmitPass : public ModulePass {
 
       HasNativeSept = true;
       Declarations.push_back("DCL     SPCPTR      @SEPT     BASPCO;");
-      Declarations.push_back("DCL     SPCPTR      .SEPT(6440) BAS(@SEPT);");
     }
 
     void ensureNativeNull() {
@@ -3461,8 +3460,25 @@ class OS400MIEmitPass : public ModulePass {
         if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
           fail("OS400MI sysptr_sept builtin signature");
         ensureNativeSept();
-        NativePtrValues[&CB] =
-            ".SEPT(" + getOperandName(CB.getArgOperand(0)) + ")";
+        std::string Original = getOriginalName(CB);
+        GeneratedName PtrName = Names.createTempName(Original);
+        GeneratedName OffsetName = Names.createTempName(Original + ".sept.off");
+        std::string Ptr = "." + PtrName.Name;
+        std::string Entry = "." + PtrName.Name + "E";
+        Declarations.push_back("DCL     SPCPTR      " + Ptr + ";");
+        Declarations.push_back("DCL     SYSPTR      " + Entry + " BAS(" + Ptr +
+                               ");");
+        Declarations.push_back("DCL     DD          " + OffsetName.Name +
+                               " BIN(4);");
+        Body.push_back("        CPYNV       " + OffsetName.Name + "," +
+                       getOperandName(CB.getArgOperand(0)) + ";");
+        Body.push_back("        SUBN        " + OffsetName.Name + "," +
+                       OffsetName.Name + ",1;");
+        Body.push_back("        MULT        " + OffsetName.Name + "," +
+                       OffsetName.Name + ",16;");
+        Body.push_back("        ADDSPP      " + Ptr + ",@SEPT," +
+                       OffsetName.Name + ";");
+        NativePtrValues[&CB] = Entry;
         return true;
       }
       if (Name == "llvm.os400mi.sysptr.program") {

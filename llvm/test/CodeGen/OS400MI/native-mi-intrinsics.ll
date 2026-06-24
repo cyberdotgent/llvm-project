@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=os400mi < %s | FileCheck %s
+; RUN: llc -mtriple=os400mi < %s | FileCheck %s --implicit-check-not='.SEPT('
 
 @hello = internal constant [14 x i8] c"Hello, world!\00"
 @file = internal constant [8 x i8] c"QSYSPRT\00"
@@ -51,6 +51,8 @@ declare ptr @llvm.os400mi.spcptr.null()
 declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 
 ; CHECK-DAG: DCL     SPCPTR      @SEPT     BASPCO;
+; CHECK-DAG: DCL     SPCPTR      .{{[A-Z0-9]+}};
+; CHECK-DAG: DCL     SYSPTR      .{{[A-Z0-9]+}}E BAS(.{{[A-Z0-9]+}});
 ; CHECK-DAG: DCL     SPCPTR      .OFCB     INIT(OFCB);
 ; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCOPEN", CTX("QSYS"), TYPE(PGM));
 ; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCLOSE", CTX("QSYS"), TYPE(PGM));
@@ -66,5 +68,9 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 ; CHECK: CPYBREP     OUTBUF," ";
 ; CHECK: CMPBLA(B)   LS_I1,X'00'/EQ(
 ; CHECK: CPYBLA      NCHAR,LS_I1;
-; CHECK: CALLX       .SEPT(PUT-ENTRY),{{[^,]+}},*;
+; CHECK: CPYNV       {{[A-Z0-9]+}},PUT-ENTRY;
+; CHECK: SUBN        {{[A-Z0-9]+}},{{[A-Z0-9]+}},1;
+; CHECK: MULT        {{[A-Z0-9]+}},{{[A-Z0-9]+}},16;
+; CHECK: ADDSPP      .{{[A-Z0-9]+}},@SEPT,{{[A-Z0-9]+}};
+; CHECK: CALLX       .{{[A-Z0-9]+}}E,{{[^,]+}},*;
 ; CHECK: CALLX       .{{[A-Z0-9]+}},{{[^,]+}},*;

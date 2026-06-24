@@ -29,10 +29,22 @@ static_assert(std::size(BuiltinInfos) == NumBuiltins);
 
 void OS400MITargetInfo::getTargetDefines(const LangOptions &Opts,
                                          MacroBuilder &Builder) const {
+  (void)Opts;
   Builder.defineMacro("__OS400MI__");
   Builder.defineMacro("__os400mi__");
   Builder.defineMacro("__OS400__");
   Builder.defineMacro("__os400__");
+  Builder.defineMacro("__SCHAR_WIDTH__", "8");
+  Builder.defineMacro("__UCHAR_WIDTH__", "8");
+  Builder.defineMacro("__SHRT_WIDTH__", Twine(getShortWidth()));
+  Builder.defineMacro("__USHRT_WIDTH__", Twine(getShortWidth()));
+  Builder.defineMacro("__INT_WIDTH__", Twine(getIntWidth()));
+  Builder.defineMacro("__UINT_WIDTH__", Twine(getIntWidth()));
+  Builder.defineMacro("__LONG_WIDTH__", Twine(getLongWidth()));
+  Builder.defineMacro("__ULONG_WIDTH__", Twine(getLongWidth()));
+  Builder.defineMacro("__LLONG_WIDTH__", Twine(getLongLongWidth()));
+  Builder.defineMacro("__LONG_LONG_WIDTH__", Twine(getLongLongWidth()));
+  Builder.defineMacro("__ULLONG_WIDTH__", Twine(getLongLongWidth()));
 }
 
 llvm::SmallVector<Builtin::InfosShard>

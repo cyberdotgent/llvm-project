@@ -12,7 +12,9 @@ define i32 @main() {
 
 ; CHECK: DCL     DD          C_MEM      CHAR(256) BDRY(16);
 ; CHECK: DCL     SPCPTR      .C_BASE    INIT(C_MEM);
-; CHECK: DCL     DD          S000001    BIN(4)     DEF(C_MEM) POS(5);
+; CHECK: DCL     DD          C_STACK    CHAR(256) BDRY(16);
+; CHECK: DCL     SPCPTR      .S_BASE    INIT(C_STACK);
+; CHECK: DCL     DD          S000001    BIN(4)     DEF(C_STACK) POS(5);
 ; CHECK: DCL     DD          T000001    BIN(4);
 ; CHECK: ENTRY MAIN INT;
 ; CHECK:         CPYNV       S000001,42;

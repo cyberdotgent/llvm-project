@@ -103,7 +103,10 @@ class OS400MIEmitPass : public ModulePass {
   std::string OutputFilename;
 
   static constexpr uint32_t ArenaSize = 256;
+  static constexpr uint32_t StackSize = 256;
   static constexpr uint32_t FirstArenaOffset = 4;
+  static constexpr uint32_t StaticRegionTag = 0x10000000;
+  static constexpr uint32_t StackRegionTag = 0x20000000;
   static constexpr size_t MaxMISourceLineLength = 80;
 
   static void fail(const Twine &Message) {
@@ -860,7 +863,7 @@ class OS400MIEmitPass : public ModulePass {
                       DirectScalar};
     }
 
-    std::optional<uint32_t> getConstantPointerOffset(const Constant *C) const {
+    std::optional<uint32_t> getConstantPointerValue(const Constant *C) const {
       if (isa<ConstantPointerNull>(C))
         return 0;
 
@@ -883,7 +886,7 @@ class OS400MIEmitPass : public ModulePass {
       auto It = Globals.find(GV);
       if (It == Globals.end() || Offset > It->second.Size)
         return std::nullopt;
-      return It->second.Offset + Offset;
+      return StaticRegionTag + It->second.Offset + Offset;
     }
 
     void writeArenaConstantBytes(const Constant *C,
@@ -894,10 +897,10 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       if (C->getType()->isPointerTy()) {
-        std::optional<uint32_t> Offset = getConstantPointerOffset(C);
-        if (!Offset)
+        std::optional<uint32_t> PointerValue = getConstantPointerValue(C);
+        if (!PointerValue)
           fail("arena pointer constants referencing laid-out globals or null");
-        storeIntegerBytes(APInt(32, *Offset), Bytes.size(), Bytes);
+        storeIntegerBytes(APInt(32, *PointerValue), Bytes.size(), Bytes);
         return;
       }
 
@@ -1016,9 +1019,9 @@ class OS400MIEmitPass : public ModulePass {
       if (!GV.getValueType()->isPointerTy())
         fail("PTR32 globals");
 
-      std::optional<uint32_t> PointerOffset =
-          getConstantPointerOffset(GV.getInitializer());
-      if (!PointerOffset)
+      std::optional<uint32_t> PointerValue =
+          getConstantPointerValue(GV.getInitializer());
+      if (!PointerValue)
         fail("PTR32 globals initialized with null or laid-out globals");
 
       uint32_t Size = 4;
@@ -1032,7 +1035,7 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          " + Name.Name +
                              "    BIN(4)     UNSGND DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(" +
-                             std::to_string(*PointerOffset) + ");");
+                             std::to_string(*PointerValue) + ");");
       addGlobalObject(GV, Name, "ptr_global", Offset, Size, Alignment,
                       AccessWidth::I32, true);
       addMapRecord(Name, "ptr_global", std::move(Original), Offset, Size,
@@ -1481,6 +1484,7 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<MapRecord, 16> MapRecords;
     std::map<std::string, std::string> ProgramSysptrCache;
     uint32_t NextArenaOffset;
+    uint32_t NextStackOffset = FirstArenaOffset;
     uint32_t NextCallBarrier = 1;
     bool HasLoadStoreLens = false;
     bool HasU1Box = false;
@@ -1565,7 +1569,7 @@ class OS400MIEmitPass : public ModulePass {
                             FrameOffset,
                             FrameSize,
                             4,
-                            "static-arena;activation=per-function;"
+                            "stack-region;activation=per-function;"
                             "reentrant=false;recursion=unsupported;"
                             "future=software-stack"});
     }
@@ -1846,16 +1850,16 @@ class OS400MIEmitPass : public ModulePass {
       return Layout.getGlobalSlot(Base, Offset);
     }
 
-    std::optional<uint32_t> getBaseArenaOffset(const Value *V) const {
+    std::optional<uint32_t> getBasePointerValue(const Value *V) const {
       if (const auto *AI = dyn_cast<AllocaInst>(V)) {
         auto It = Slots.find(AI);
         if (It == Slots.end())
           return std::nullopt;
-        return It->second.Offset;
+        return StackRegionTag + It->second.Offset;
       }
 
       if (std::optional<ArenaSlot> Slot = Layout.getGlobalSlot(V))
-        return Slot->Offset;
+        return StaticRegionTag + Slot->Offset;
 
       return std::nullopt;
     }
@@ -2721,29 +2725,29 @@ class OS400MIEmitPass : public ModulePass {
 
       uint32_t Alignment = ScalarInt ? 4 : getABIAlignment(DL, AllocatedTy);
       uint32_t Offset =
-          ScalarInt ? alignTo4(NextArenaOffset)
-                    : static_cast<uint32_t>(alignTo(NextArenaOffset, Alignment));
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
+          ScalarInt ? alignTo4(NextStackOffset)
+                    : static_cast<uint32_t>(alignTo(NextStackOffset, Alignment));
+      if (Offset + Size > StackSize)
+        fail("phase-1 stack storage within 256 bytes");
 
       std::string Original = getOriginalName(AI);
       GeneratedName SlotName = Names.createSlotName(Original);
       ArenaSlot Slot{SlotName.Name, Offset, Size, Width,
                      ScalarInt && Width != AccessWidth::I64};
-      NextArenaOffset = Offset + Size;
+      NextStackOffset = Offset + Size;
       Slots[&AI] = Slot;
       if (ScalarInt && Width == AccessWidth::I32) {
         Declarations.push_back("DCL     DD          " + Slot.Name +
-                               "    BIN(4)     DEF(C_MEM) POS(" +
+                               "    BIN(4)     DEF(C_STACK) POS(" +
                                std::to_string(Slot.Offset + 1) + ");");
       } else if (ScalarInt && Width == AccessWidth::I16) {
         Declarations.push_back("DCL     DD          " + Slot.Name +
-                               "    BIN(2)     UNSGND DEF(C_MEM) POS(" +
+                               "    BIN(2)     UNSGND DEF(C_STACK) POS(" +
                                std::to_string(Slot.Offset + 1) + ");");
       } else {
         Declarations.push_back("DCL     DD          " + Slot.Name +
                                "    CHAR(" + std::to_string(Size) +
-                               ")    DEF(C_MEM) POS(" +
+                               ")    DEF(C_STACK) POS(" +
                                std::to_string(Slot.Offset + 1) + ");");
       }
       addMapRecord(SlotName, "local", std::move(Original),
@@ -3044,8 +3048,8 @@ class OS400MIEmitPass : public ModulePass {
       if (isa<ConstantPointerNull>(V))
         return "0";
 
-      if (std::optional<uint32_t> Offset = getBaseArenaOffset(V))
-        return std::to_string(*Offset);
+      if (std::optional<uint32_t> PointerValue = getBasePointerValue(V))
+        return std::to_string(*PointerValue);
 
       auto It = Values.find(V);
       if (It != Values.end())
@@ -3055,8 +3059,9 @@ class OS400MIEmitPass : public ModulePass {
         const Value *Base = GEP->getPointerOperand();
         APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
         if (GEP->accumulateConstantOffset(DL, ConstantOffset)) {
-          if (std::optional<uint32_t> BaseOffset = getBaseArenaOffset(Base))
-            return std::to_string(*BaseOffset + ConstantOffset.getZExtValue());
+          if (std::optional<uint32_t> BasePointer = getBasePointerValue(Base))
+            return std::to_string(*BasePointer +
+                                  ConstantOffset.getZExtValue());
         }
       }
 
@@ -3066,7 +3071,8 @@ class OS400MIEmitPass : public ModulePass {
     std::string getPointerOffsetName(const Value *V) const {
       if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
         return *Offset;
-      fail("arena PTR32 offsets from allocas, globals, or getelementptr");
+      fail("region-tagged PTR32 values from allocas, globals, or "
+           "getelementptr");
       llvm_unreachable("fail should not return");
     }
 
@@ -3253,13 +3259,46 @@ class OS400MIEmitPass : public ModulePass {
 
     void emitSetLensPointer(const Value *Ptr) {
       ensureLoadStoreLens();
-      emitSetLensPointerFromOffset(getPointerOffsetName(Ptr));
+      emitSetLensPointerFromPointerValue(getPointerOffsetName(Ptr));
     }
 
     void emitSetLensPointerFromOffset(StringRef Offset) {
       ensureLoadStoreLens();
       Body.push_back("        CPYNV       OFF," + Offset.str() + ";");
       Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+    }
+
+    void emitSetLensPointerFromPointerValue(StringRef PointerValue) {
+      ensureLoadStoreLens();
+      GeneratedName StaticName = Names.createBlockName();
+      GeneratedName StackName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string StaticLabel = StaticName.Name;
+      std::string StackLabel = StackName.Name;
+      std::string DoneLabel = DoneName.Name;
+      addMapRecord(StaticName, "ptr_decode_static", "", std::nullopt);
+      addMapRecord(StackName, "ptr_decode_stack", "", std::nullopt);
+      addMapRecord(DoneName, "ptr_decode_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       OFF," + PointerValue.str() + ";");
+      Body.push_back("        CMPNV(B)    OFF," +
+                     std::to_string(StackRegionTag) + "/NLO(" + StackLabel +
+                     ");");
+      Body.push_back("        CMPNV(B)    OFF," +
+                     std::to_string(StaticRegionTag) + "/NLO(" + StaticLabel +
+                     ");");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(StaticLabel + ":");
+      Body.push_back("        SUBN        OFF,OFF," +
+                     std::to_string(StaticRegionTag) + ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        B           " + DoneLabel + ";");
+      Body.push_back(StackLabel + ":");
+      Body.push_back("        SUBN        OFF,OFF," +
+                     std::to_string(StackRegionTag) + ";");
+      Body.push_back("        ADDSPP      .LS,.S_BASE,OFF;");
+      Body.push_back(DoneLabel + ":");
     }
 
     std::string getPointerOffsetPlus(StringRef Base, uint64_t Offset) {
@@ -3330,8 +3369,7 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        CPYNV       " + Index + ",0;");
       Body.push_back(Loop + ":");
       Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
-      Body.push_back("        CPYNV       OFF," + Source + ";");
-      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      emitSetLensPointerFromPointerValue(Source);
       Body.push_back("        CMPBLA(B)   LS_I1,X'00'/EQ(" + Done + ");");
       Body.push_back("        ADDSPP      .NCHAR," + Dest + "," + Index + ";");
       Body.push_back("        CPYBLA      NCHAR,LS_I1;");
@@ -3366,8 +3404,7 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
       Body.push_back("        ADDSPP      .NCHAR," + Source + "," + Index +
                      ";");
-      Body.push_back("        CPYNV       OFF," + Dest + ";");
-      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      emitSetLensPointerFromPointerValue(Dest);
       Body.push_back("        CPYBLA      LS_I1,NCHAR;");
       Body.push_back("        CMPBLA(B)   LS_I1,X'00'/EQ(" + Done + ");");
       Body.push_back("        ADDN        " + Dest + "," + Dest + ",1;");
@@ -3777,10 +3814,17 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        CPYBLA      LS_I1,X'" + getByteHex(Byte) + "';");
     }
 
+    void emitStoreByteToPointerValue(StringRef PointerValue,
+                                     uint64_t ByteOffset, uint8_t Byte) {
+      emitSetLensPointerFromPointerValue(
+          getPointerOffsetPlus(PointerValue, ByteOffset));
+      Body.push_back("        CPYBLA      LS_I1,X'" + getByteHex(Byte) + "';");
+    }
+
     void emitStoreBytesToPointer(const Value *Ptr, ArrayRef<uint8_t> Bytes) {
       std::string Base = getPointerOffsetName(Ptr);
       for (uint64_t I = 0, E = Bytes.size(); I != E; ++I)
-        emitStoreByteToPointer(Base, I, Bytes[I]);
+        emitStoreByteToPointerValue(Base, I, Bytes[I]);
     }
 
     void emitCopyBytesByOffset(StringRef DestBase, StringRef SourceBase,
@@ -3796,8 +3840,15 @@ class OS400MIEmitPass : public ModulePass {
 
     void emitCopyBytes(const Value *DestPtr, const Value *SourcePtr,
                        uint64_t Size) {
-      emitCopyBytesByOffset(getPointerOffsetName(DestPtr),
-                            getPointerOffsetName(SourcePtr), Size);
+      ensureU1Box();
+      std::string DestBase = getPointerOffsetName(DestPtr);
+      std::string SourceBase = getPointerOffsetName(SourcePtr);
+      for (uint64_t I = 0; I != Size; ++I) {
+        emitSetLensPointerFromPointerValue(getPointerOffsetPlus(SourceBase, I));
+        Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+        emitSetLensPointerFromPointerValue(getPointerOffsetPlus(DestBase, I));
+        Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      }
     }
 
     void emitFillBytesByOffset(StringRef DestBase, uint64_t Size,
@@ -3821,7 +3872,23 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void emitFillBytes(const Value *DestPtr, uint64_t Size, const Value *Byte) {
-      emitFillBytesByOffset(getPointerOffsetName(DestPtr), Size, Byte);
+      std::string DestBase = getPointerOffsetName(DestPtr);
+      std::optional<std::string> ConstantHex;
+      if (const auto *CI = dyn_cast<ConstantInt>(Byte))
+        ConstantHex = getByteHex(*CI);
+      else {
+        ensureU1Box();
+        Body.push_back("        CPYNV       U1_NUM," + getOperandName(Byte) +
+                       ";");
+      }
+
+      for (uint64_t I = 0; I != Size; ++I) {
+        emitSetLensPointerFromPointerValue(getPointerOffsetPlus(DestBase, I));
+        if (ConstantHex)
+          Body.push_back("        CPYBLA      LS_I1,X'" + *ConstantHex + "';");
+        else
+          Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+      }
     }
 
     std::string getMemoryLengthName(const Value *V) {
@@ -3859,9 +3926,9 @@ class OS400MIEmitPass : public ModulePass {
                      getMemoryLengthName(Length) + ";");
       Body.push_back(Loop + ":");
       Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
-      emitSetLensPointerFromOffset(Source);
+      emitSetLensPointerFromPointerValue(Source);
       Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
-      emitSetLensPointerFromOffset(Dest);
+      emitSetLensPointerFromPointerValue(Dest);
       Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
       Body.push_back("        ADDN        " + Source + "," + Source + ",1;");
       Body.push_back("        ADDN        " + Dest + "," + Dest + ",1;");
@@ -3896,7 +3963,7 @@ class OS400MIEmitPass : public ModulePass {
                      getMemoryLengthName(Length) + ";");
       Body.push_back(Loop + ":");
       Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
-      emitSetLensPointerFromOffset(Dest);
+      emitSetLensPointerFromPointerValue(Dest);
       if (ConstantHex)
         Body.push_back("        CPYBLA      LS_I1,X'" + *ConstantHex + "';");
       else
@@ -3914,9 +3981,25 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
 
+    void emitLoadI64FromPointerValue(const I64Value &Dest,
+                                     StringRef SourceBase) {
+      for (uint64_t I = 0; I != 8; ++I) {
+        emitSetLensPointerFromPointerValue(getPointerOffsetPlus(SourceBase, I));
+        Body.push_back("        CPYBLA      " + Dest.Byte[I] + ",LS_I1;");
+      }
+    }
+
     void emitStoreI64ToOffset(StringRef DestBase, const I64Value &Source) {
       for (uint64_t I = 0; I != 8; ++I) {
         emitSetLensPointerFromOffset(getPointerOffsetPlus(DestBase, I));
+        Body.push_back("        CPYBLA      LS_I1," + Source.Byte[I] + ";");
+      }
+    }
+
+    void emitStoreI64ToPointerValue(StringRef DestBase,
+                                    const I64Value &Source) {
+      for (uint64_t I = 0; I != 8; ++I) {
+        emitSetLensPointerFromPointerValue(getPointerOffsetPlus(DestBase, I));
         Body.push_back("        CPYBLA      LS_I1," + Source.Byte[I] + ";");
       }
     }
@@ -3972,17 +4055,24 @@ class OS400MIEmitPass : public ModulePass {
 
       if (ValueTy->isIntegerTy(64)) {
         I64Value Source = getI64Operand(SI.getValueOperand());
-        emitStoreI64ToOffset(getPointerOffsetName(SI.getPointerOperand()),
-                             Source);
+        emitStoreI64ToPointerValue(getPointerOffsetName(SI.getPointerOperand()),
+                                   Source);
         return;
       }
 
       if (!isSupportedInt(ValueTy) && !isPTR32(ValueTy)) {
         auto AggIt = AggregateValues.find(SI.getValueOperand());
         if (AggIt != AggregateValues.end()) {
-          emitCopyBytesByOffset(getPointerOffsetName(SI.getPointerOperand()),
-                                std::to_string(AggIt->second.Offset),
-                                AggIt->second.Size);
+          ensureU1Box();
+          std::string DestBase = getPointerOffsetName(SI.getPointerOperand());
+          std::string SourceBase = std::to_string(AggIt->second.Offset);
+          for (uint64_t I = 0; I != AggIt->second.Size; ++I) {
+            emitSetLensPointerFromOffset(getPointerOffsetPlus(SourceBase, I));
+            Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+            emitSetLensPointerFromPointerValue(
+                getPointerOffsetPlus(DestBase, I));
+            Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+          }
           return;
         }
 
@@ -4025,16 +4115,23 @@ class OS400MIEmitPass : public ModulePass {
 
       if (LI.getType()->isIntegerTy(64)) {
         I64Value Dest = createI64Temp(LI);
-        emitLoadI64FromOffset(Dest, getPointerOffsetName(LI.getPointerOperand()));
+        emitLoadI64FromPointerValue(
+            Dest, getPointerOffsetName(LI.getPointerOperand()));
         I64Values[&LI] = Dest;
         return;
       }
 
       if (!isSupportedInt(LI.getType()) && !isPTR32(LI.getType())) {
         ArenaSlot Slot = createAggregateTemp(LI, LI.getType(), "aggregate_temp");
-        emitCopyBytesByOffset(std::to_string(Slot.Offset),
-                              getPointerOffsetName(LI.getPointerOperand()),
-                              Slot.Size);
+        ensureU1Box();
+        std::string DestBase = std::to_string(Slot.Offset);
+        std::string SourceBase = getPointerOffsetName(LI.getPointerOperand());
+        for (uint64_t I = 0; I != Slot.Size; ++I) {
+          emitSetLensPointerFromPointerValue(getPointerOffsetPlus(SourceBase, I));
+          Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+          emitSetLensPointerFromOffset(getPointerOffsetPlus(DestBase, I));
+          Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+        }
         AggregateValues[&LI] = Slot;
         return;
       }
@@ -4497,7 +4594,7 @@ class OS400MIEmitPass : public ModulePass {
 
       Body.push_back("ENTRY " + CurrentFunction->EntryName + " INT;");
 
-      uint32_t FrameOffset = NextArenaOffset;
+      uint32_t FrameOffset = NextStackOffset;
       unsigned ArgIndex = 0;
       for (const Argument &Arg : F.args()) {
         const FunctionInfo::Slot &ArgSlot = CurrentFunction->Args[ArgIndex++];
@@ -4598,7 +4695,7 @@ class OS400MIEmitPass : public ModulePass {
       for (const std::string &Line : EdgeBlocks)
         Body.push_back(Line);
 
-      addFrameMapRecord(FrameOffset, NextArenaOffset - FrameOffset);
+      addFrameMapRecord(FrameOffset, NextStackOffset - FrameOffset);
     }
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }
@@ -4627,6 +4724,9 @@ class OS400MIEmitPass : public ModulePass {
     Lines.push_back("DCL     DD          C_MEM      CHAR(" +
                     std::to_string(Layout.getArenaSize()) + ") BDRY(16);");
     Lines.push_back("DCL     SPCPTR      .C_BASE    INIT(C_MEM);");
+    Lines.push_back("DCL     DD          C_STACK    CHAR(" +
+                    std::to_string(StackSize) + ") BDRY(16);");
+    Lines.push_back("DCL     SPCPTR      .S_BASE    INIT(C_STACK);");
     for (const std::string &Decl : Layout.getDeclarations())
       Lines.push_back(Decl);
     for (const std::string &Decl : Plan.getDeclarations())
@@ -4744,6 +4844,9 @@ class OS400MIEmitPass : public ModulePass {
     emitMapRecord(MapOS,
                   makeFixedMapRecord("C_MEM", "arena", "reserved", "", {},
                                      0, Layout.getArenaSize(), 16));
+    emitMapRecord(MapOS,
+                  makeFixedMapRecord("C_STACK", "stack", "reserved", "", {},
+                                     0, StackSize, 16));
     emitMapRecord(MapOS, makeFixedMapRecord("MAIN_RC", "return_slot",
                                             "reserved", "", {}, std::nullopt,
                                             4, 4));
@@ -4774,6 +4877,8 @@ public:
     Names.reserveName("MAIN_RC");
     Names.reserveName("C_MEM");
     Names.reserveName(".C_BASE");
+    Names.reserveName("C_STACK");
+    Names.reserveName(".S_BASE");
     Names.reserveName("MAIN");
     Names.reserveName(".MAIN");
 

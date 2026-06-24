@@ -22,7 +22,7 @@ entry:
 }
 
 ; CHECK: DCL DD G000001 CHAR(8) DEF(C_MEM) POS(5) INIT(X'0123456789ABCDEF');
-; CHECK: DCL     DD          [[SLOT:S[0-9]+]]    CHAR(8)    DEF(C_MEM)
+; CHECK: DCL     DD          [[SLOT:S[0-9]+]]    CHAR(8)    DEF(C_STACK)
 ; CHECK: DCL     DD          [[I64:T[0-9]+]]    CHAR(8);
 ; CHECK: DCL     DD          [[I64]]H    BIN(4)     DEF([[I64]]) POS(1);
 ; CHECK: DCL     DD          [[I64]]U    BIN(4)     UNSGND DEF([[I64]]) POS(1);

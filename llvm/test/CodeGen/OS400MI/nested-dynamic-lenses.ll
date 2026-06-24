@@ -15,13 +15,13 @@ entry:
   ret i32 %r
 }
 
-; CHECK: DCL     DD          S000001    CHAR(8)    DEF(C_MEM) POS(5);
+; CHECK: DCL     DD          S000001    CHAR(8)    DEF(C_STACK) POS(5);
 ; CHECK:         ADDN        T000001,1,2;
-; CHECK:         ADDN        T000002,T000001,4;
+; CHECK:         ADDN        T000002,T000001,536870916;
 ; CHECK:         ADDN        T000003,T000002,2;
 ; CHECK:         CPYNV       OFF,T000003;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYBLA      LS_I1,X'7F';
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYBLA      LS_I1,X'7F';
 ; CHECK:         CPYNV       OFF,T000003;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYBLA      U1_BOX,X'00000000';
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYBLA      U1_BOX,X'00000000';

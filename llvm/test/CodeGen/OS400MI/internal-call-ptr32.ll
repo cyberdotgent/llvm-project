@@ -28,8 +28,9 @@ entry:
 ; CHECK: DCL     DD          F000001R    BIN(4)     UNSGND;
 ; CHECK: DCL     DD          F000001A1    BIN(4)     UNSGND;
 ; CHECK: DCL     DD          F000002A1    BIN(4)     UNSGND;
+; CHECK: DCL     DD          S000001    BIN(4)     DEF(C_STACK) POS(5);
 ; CHECK: ENTRY MAIN INT;
-; CHECK: CPYNV       F000001A1,4;
+; CHECK: CPYNV       F000001A1,536870916;
 ; CHECK: CALLI       F000001, *, .F000001;
 ; CHECK: CPYNV       [[PTR:T[0-9]+]],F000001R;
 ; CHECK: CPYNV       F000002A1,[[PTR]];
@@ -38,7 +39,9 @@ entry:
 ; CHECK: CPYNV       F000001R,F000001A1;
 ; CHECK: ENTRY F000002 INT;
 ; CHECK: CPYNV       OFF,F000002A1;
-; CHECK: ADDSPP      .LS,.C_BASE,OFF;
+; CHECK: CMPNV(B)    OFF,536870912/NLO(
+; CHECK: SUBN        OFF,OFF,536870912;
+; CHECK: ADDSPP      .LS,.S_BASE,OFF;
 ; CHECK: CPYNV       [[LOAD:T[0-9]+]],LS_I4;
 ; CHECK: CPYNV       F000002R,[[LOAD]];
 ; CHECK: PEND;
@@ -48,7 +51,7 @@ entry:
 ; MAP-SAME: "original":"main"
 ; MAP-SAME: "arena_offset":4
 ; MAP-SAME: "size":4
-; MAP-SAME: "encoding":"static-arena;activation=per-function;reentrant=false;recursion=unsupported;future=software-stack"
+; MAP-SAME: "encoding":"stack-region;activation=per-function;reentrant=false;recursion=unsupported;future=software-stack"
 ; MAP: "mi_name":"F000001_FRAME"
 ; MAP-SAME: "kind":"frame"
 ; MAP-SAME: "original":"idp"

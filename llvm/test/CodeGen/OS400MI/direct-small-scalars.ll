@@ -28,8 +28,8 @@ entry:
 
 ; CHECK: DCL     DD          G000001    CHAR(1)    DEF(C_MEM) POS(5) INIT(X'FE');
 ; CHECK: DCL     DD          G000002    BIN(2)     UNSGND DEF(C_MEM) POS(7) INIT(65534);
-; CHECK: DCL     DD          S000001    CHAR(1)    DEF(C_MEM) POS(9);
-; CHECK: DCL     DD          S000002    BIN(2)     UNSGND DEF(C_MEM) POS(13);
+; CHECK: DCL     DD          S000001    CHAR(1)    DEF(C_STACK) POS(5);
+; CHECK: DCL     DD          S000002    BIN(2)     UNSGND DEF(C_STACK) POS(9);
 ; CHECK: DCL     DD          U1_BOX    CHAR(4);
 ; CHECK:         CPYBLA      S000001,X'FF';
 ; CHECK:         CPYNV       S000002,65535;

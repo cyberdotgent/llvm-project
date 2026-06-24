@@ -27,8 +27,8 @@ entry:
 
 ; CHECK: DCL DD G000001 CHAR(4) DEF(C_MEM) POS(5);
 ; CHECK-NEXT: DCL DD H000001 CHAR(4) DEF(G000001) POS(1) INIT(X'0A141E28');
-; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_MEM)
-; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_MEM)
+; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_STACK)
+; CHECK: DCL     DD          {{S[0-9]+}}    CHAR(4)    DEF(C_STACK)
 ; CHECK: CPYBLA      U1_BYTE,LS_I1;
 ; CHECK: CPYBLA      LS_I1,U1_BYTE;
 ; CHECK: CPYBLA      LS_I1,X'05';

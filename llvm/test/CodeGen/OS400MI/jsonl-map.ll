@@ -27,6 +27,7 @@ else:
 ; MI: B000003:
 
 ; MAP: {"mi_name":"C_MEM","kind":"arena","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
+; MAP-NEXT: {"mi_name":"C_STACK","kind":"stack","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
 ; MAP-NEXT: {"mi_name":"MAIN_RC","kind":"return_slot","name_class":"reserved","max_name_length":48,"collision":false,"size":4,"alignment":4}
 ; MAP-NEXT: {"mi_name":"MAIN","kind":"function","name_class":"function","max_name_length":48,"collision":false,"original":"main"}
 ; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","name_class":"label","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"entry"}
@@ -35,3 +36,4 @@ else:
 ; MAP-NEXT: {"mi_name":"S000001","kind":"local","name_class":"local","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"p","arena_offset":4,"size":4,"alignment":4}
 ; MAP-NEXT: {"mi_name":"T000001","kind":"temp","name_class":"temp","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"v","size":4,"alignment":4}
 ; MAP-NEXT: {"mi_name":"T000002","kind":"temp","name_class":"temp","name_ordinal":2,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"x","size":4,"alignment":4}
+; MAP-NEXT: {"mi_name":"MAIN_FRAME","kind":"frame","name_class":"frame","max_name_length":48,"collision":false,"original":"main","arena_offset":4,"size":4,"alignment":4,"encoding":"stack-region;activation=per-function;reentrant=false;recursion=unsupported;future=software-stack"}

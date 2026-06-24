@@ -19,20 +19,20 @@ entry:
   ret i32 %sum
 }
 
-; CHECK: DCL     DD          S000001    CHAR(4)    DEF(C_MEM) POS(5);
-; CHECK: DCL     DD          S000002    CHAR(8)    DEF(C_MEM) POS(9);
+; CHECK: DCL     DD          S000001    CHAR(4)    DEF(C_STACK) POS(5);
+; CHECK: DCL     DD          S000002    CHAR(8)    DEF(C_STACK) POS(9);
 ; CHECK: DCL     DD          LS_I1     CHAR(1)    DIR        POS(1);
 ; CHECK: DCL     DD          LS_I2     BIN(2)     UNSGND DIR POS(1);
 ; CHECK: DCL     DD          U1_BOX    CHAR(4);
 ; CHECK: DCL     DD          U1_NUM    BIN(4)     DEF(U1_BOX) POS(1);
 ; CHECK: DCL     DD          U1_BYTE   CHAR(1)    DEF(U1_BOX) POS(4);
-; CHECK:         CPYNV       OFF,6;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYBLA      LS_I1,X'2A';
+; CHECK:         CPYNV       OFF,536870918;
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYBLA      LS_I1,X'2A';
 ; CHECK:         CPYBLA      U1_BOX,X'00000000';
 ; CHECK-NEXT:         CPYBLA      U1_BYTE,LS_I1;
 ; CHECK-NEXT:         CPYNV       T000001,U1_NUM;
-; CHECK:         CPYNV       OFF,12;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYNV       LS_I2,1234;
+; CHECK:         CPYNV       OFF,536870924;
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYNV       LS_I2,1234;
 ; CHECK:         CPYNV       T000002,LS_I2;

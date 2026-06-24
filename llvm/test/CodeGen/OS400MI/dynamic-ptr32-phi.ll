@@ -25,7 +25,9 @@ done:
   ret i32 %v
 }
 
-; CHECK: DCL     DD          S000001    CHAR(16)    DEF(C_MEM) POS(5);
+; CHECK: DCL     DD          C_STACK    CHAR(256) BDRY(16);
+; CHECK: DCL     SPCPTR      .S_BASE    INIT(C_STACK);
+; CHECK: DCL     DD          S000001    CHAR(16)    DEF(C_STACK) POS(5);
 ; CHECK: DCL     SPCPTR      .LS;
 ; CHECK: DCL     DD          OFF       BIN(4);
 ; CHECK: DCL     SPC         LOADSTORE BAS(.LS);
@@ -36,19 +38,19 @@ done:
 ; CHECK: B000002:
 ; CHECK-NEXT:         ADDN        T000002,T000001,T000001;
 ; CHECK-NEXT:         ADDN        T000003,T000002,T000002;
-; CHECK-NEXT:         ADDN        T000004,T000003,4;
+; CHECK-NEXT:         ADDN        T000004,T000003,536870916;
 ; CHECK-NEXT:         CPYNV       OFF,T000004;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYNV       LS_I4,T000001;
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYNV       LS_I4,T000001;
 ; CHECK:         CMPNV(B)    T000005,3/LO(B000003);
 ; CHECK-NEXT:         B           B000004;
 ; CHECK: B000004:
-; CHECK-NEXT:         CPYNV       OFF,12;
-; CHECK-NEXT:         ADDSPP      .LS,.C_BASE,OFF;
-; CHECK-NEXT:         CPYNV       T000006,LS_I4;
+; CHECK-NEXT:         CPYNV       OFF,536870924;
+; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
+; CHECK:              CPYNV       T000006,LS_I4;
 ; CHECK: B000005:
 ; CHECK-NEXT:         CPYNV       T000001,0;
 ; CHECK-NEXT:         B           B000002;
-; CHECK: B000006:
+; CHECK: B000009:
 ; CHECK-NEXT:         CPYNV       T000001,T000005;
 ; CHECK-NEXT:         B           B000002;

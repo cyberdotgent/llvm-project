@@ -23,10 +23,10 @@ entry:
 
 ; CHECK: DCL     DD          G000001    BIN(4)     DEF(C_MEM) POS(5) INIT(7);
 ; CHECK: DCL DD G000002 CHAR(8) DEF(C_MEM) POS(9);
-; CHECK-NEXT: DCL DD H000001 CHAR(8) DEF(G000002) POS(1) INIT(X'0000000400000009');
+; CHECK-NEXT: DCL DD H000001 CHAR(8) DEF(G000002) POS(1) INIT(X'1000000400000009');
 ; CHECK: CPYNV       {{T[0-9]+}},{{LS_I4|G[0-9]+}};
 ; CHECK: CPYNV       {{T[0-9]+}},0;
-; CHECK: CMPNV(B)    {{T[0-9]+}},4/EQ({{B[0-9]+}});
+; CHECK: CMPNV(B)    {{T[0-9]+}},268435460/EQ({{B[0-9]+}});
 ; CHECK: CPYNV       {{T[0-9]+}},{{T[0-9]+}};
 ; CHECK: CPYNV       {{S[0-9]+}},{{T[0-9]+}};
 ; CHECK: CPYNV       {{T[0-9]+}},0;

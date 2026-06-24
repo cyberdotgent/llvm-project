@@ -13,12 +13,24 @@ class OS400MIBuiltin<string prototype> : TargetBuiltin {
   let Attributes = [NoThrow];
 }
 
-def UfcbQsysprt : OS400MIBuiltin<"void *()"> {
-  let Spellings = ["__builtin_os400mi_ufcb_qsysprt"];
+def Ufcb : OS400MIBuiltin<"void *()"> {
+  let Spellings = ["__builtin_os400mi_ufcb"];
 }
 
 def UfcbOutbuf : OS400MIBuiltin<"void *(void *)"> {
   let Spellings = ["__builtin_os400mi_ufcb_outbuf"];
+}
+
+def UfcbFile : OS400MIBuiltin<"void *(void *)"> {
+  let Spellings = ["__builtin_os400mi_ufcb_file"];
+}
+
+def UfcbLibrary : OS400MIBuiltin<"void *(void *)"> {
+  let Spellings = ["__builtin_os400mi_ufcb_library"];
+}
+
+def UfcbMember : OS400MIBuiltin<"void *(void *)"> {
+  let Spellings = ["__builtin_os400mi_ufcb_member"];
 }
 
 def UfcbOdp : OS400MIBuiltin<"void *(void *)"> {
@@ -51,6 +63,11 @@ def CharFill : OS400MIBuiltin<"void(void *, unsigned int, int)"> {
 
 def CharFromCstr : OS400MIBuiltin<"void(void *, unsigned int, char const *)"> {
   let Spellings = ["__builtin_os400mi_char_from_cstr"];
+}
+
+def CharFromCstrBlankPadded
+    : OS400MIBuiltin<"void(void *, unsigned int, char const *)"> {
+  let Spellings = ["__builtin_os400mi_char_from_cstr_blank_padded"];
 }
 
 def Callx0 : OS400MIBuiltin<"void(void *)"> {

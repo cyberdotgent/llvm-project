@@ -1,10 +1,19 @@
 ; RUN: llc -mtriple=os400mi < %s | FileCheck %s
 
 @hello = internal constant [14 x i8] c"Hello, world!\00"
+@file = internal constant [8 x i8] c"QSYSPRT\00"
+@library = internal constant [6 x i8] c"*LIBL\00"
+@member = internal constant [7 x i8] c"*FIRST\00"
 
 define i32 @main() {
 entry:
-  %ufcb = call ptr @llvm.os400mi.ufcb.qsysprt()
+  %ufcb = call ptr @llvm.os400mi.ufcb()
+  %filep = call ptr @llvm.os400mi.ufcb.file(ptr %ufcb)
+  call void @llvm.os400mi.char.from.cstr.blank.padded(ptr %filep, i32 10, ptr @file)
+  %libraryp = call ptr @llvm.os400mi.ufcb.library(ptr %ufcb)
+  call void @llvm.os400mi.char.from.cstr.blank.padded(ptr %libraryp, i32 10, ptr @library)
+  %memberp = call ptr @llvm.os400mi.ufcb.member(ptr %ufcb)
+  call void @llvm.os400mi.char.from.cstr.blank.padded(ptr %memberp, i32 10, ptr @member)
   %open = call ptr @llvm.os400mi.sysptr.sept(i16 12)
   call void @llvm.os400mi.callx.1(ptr %open, ptr %ufcb)
   %out = call ptr @llvm.os400mi.ufcb.outbuf(ptr %ufcb)
@@ -21,12 +30,16 @@ entry:
   ret i32 0
 }
 
-declare ptr @llvm.os400mi.ufcb.qsysprt()
+declare ptr @llvm.os400mi.ufcb()
+declare ptr @llvm.os400mi.ufcb.file(ptr)
+declare ptr @llvm.os400mi.ufcb.library(ptr)
+declare ptr @llvm.os400mi.ufcb.member(ptr)
 declare ptr @llvm.os400mi.sysptr.sept(i16)
 declare void @llvm.os400mi.callx.1(ptr, ptr)
 declare ptr @llvm.os400mi.ufcb.outbuf(ptr)
 declare void @llvm.os400mi.char.fill(ptr, i32, i32)
 declare void @llvm.os400mi.char.from.cstr(ptr, i32, ptr)
+declare void @llvm.os400mi.char.from.cstr.blank.padded(ptr, i32, ptr)
 declare ptr @llvm.os400mi.ufcb.odp(ptr)
 declare i16 @llvm.os400mi.odp.dcb.put(ptr)
 declare ptr @llvm.os400mi.dm.put.wait.option()
@@ -35,8 +48,14 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 
 ; CHECK-DAG: DCL     SPCPTR      @SEPT     BASPCO;
 ; CHECK-DAG: DCL     SPCPTR      .OFCB     INIT(OFCB);
+; CHECK-DAG: DCL     DD          OFCB-FILE    CHAR(10) DEF(OFCB) POS(129);
+; CHECK-DAG: DCL     DD          OFCB-LIBRARY CHAR(10) DEF(OFCB) POS(141);
+; CHECK-DAG: DCL     DD          OFCB-MEMBER  CHAR(10) DEF(OFCB) POS(153);
 ; CHECK-DAG: DCL     DD          OUTBUF    CHAR(132) BAS(.OFCB-OUTBUF);
 ; CHECK-DAG: DCL     DD          NCHAR     CHAR(1)    BAS(.NCHAR);
+; CHECK-NOT: INIT("QSYSPRT")
+; CHECK-NOT: INIT("*LIBL")
+; CHECK-NOT: INIT("*FIRST")
 ; CHECK: CALLX       .SEPT(12),{{[^,]+}},*;
 ; CHECK: CPYBREP     OUTBUF," ";
 ; CHECK: CMPBLA(B)   LS_I1,X'00'/EQ(

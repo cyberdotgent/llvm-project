@@ -185,6 +185,194 @@ class OS400MIEmitPass : public ModulePass {
       fail("OS400MI inline asm without asm-goto labels");
   }
 
+  enum class EBCDICCodePage { IBM037 };
+
+  static constexpr EBCDICCodePage DefaultEBCDICCodePage =
+      EBCDICCodePage::IBM037;
+
+  static StringRef getEBCDICEncodingName(EBCDICCodePage CodePage) {
+    switch (CodePage) {
+    case EBCDICCodePage::IBM037:
+      return "ibm-037";
+    }
+    llvm_unreachable("unknown EBCDIC code page");
+  }
+
+  static uint8_t encodeIBM037Byte(uint8_t Byte) {
+    if (Byte == 0)
+      return 0;
+
+    switch (Byte) {
+    case '\t':
+      return 0x05;
+    case '\n':
+      return 0x25;
+    case '\r':
+      return 0x0D;
+    case ' ':
+      return 0x40;
+    case '!':
+      return 0x5A;
+    case '"':
+      return 0x7F;
+    case '#':
+      return 0x7B;
+    case '$':
+      return 0x5B;
+    case '%':
+      return 0x6C;
+    case '&':
+      return 0x50;
+    case '\'':
+      return 0x7D;
+    case '(':
+      return 0x4D;
+    case ')':
+      return 0x5D;
+    case '*':
+      return 0x5C;
+    case '+':
+      return 0x4E;
+    case ',':
+      return 0x6B;
+    case '-':
+      return 0x60;
+    case '.':
+      return 0x4B;
+    case '/':
+      return 0x61;
+    case ':':
+      return 0x7A;
+    case ';':
+      return 0x5E;
+    case '<':
+      return 0x4C;
+    case '=':
+      return 0x7E;
+    case '>':
+      return 0x6E;
+    case '?':
+      return 0x6F;
+    case '@':
+      return 0x7C;
+    case '[':
+      return 0xBA;
+    case '\\':
+      return 0xE0;
+    case ']':
+      return 0xBB;
+    case '^':
+      return 0xB0;
+    case '_':
+      return 0x6D;
+    case '`':
+      return 0x79;
+    case '{':
+      return 0xC0;
+    case '|':
+      return 0x4F;
+    case '}':
+      return 0xD0;
+    case '~':
+      return 0xA1;
+    default:
+      break;
+    }
+
+    if (Byte >= '0' && Byte <= '9')
+      return 0xF0 + (Byte - '0');
+    if (Byte >= 'A' && Byte <= 'I')
+      return 0xC1 + (Byte - 'A');
+    if (Byte >= 'J' && Byte <= 'R')
+      return 0xD1 + (Byte - 'J');
+    if (Byte >= 'S' && Byte <= 'Z')
+      return 0xE2 + (Byte - 'S');
+    if (Byte >= 'a' && Byte <= 'i')
+      return 0x81 + (Byte - 'a');
+    if (Byte >= 'j' && Byte <= 'r')
+      return 0x91 + (Byte - 'j');
+    if (Byte >= 's' && Byte <= 'z')
+      return 0xA2 + (Byte - 's');
+
+    fail("ASCII byte is not representable in the configured EBCDIC code page");
+    llvm_unreachable("fail should not return");
+  }
+
+  static uint8_t encodeEBCDICByte(uint8_t Byte, EBCDICCodePage CodePage) {
+    switch (CodePage) {
+    case EBCDICCodePage::IBM037:
+      return encodeIBM037Byte(Byte);
+    }
+    llvm_unreachable("unknown EBCDIC code page");
+  }
+
+  static bool canEncodeEBCDICByte(uint8_t Byte, EBCDICCodePage CodePage) {
+    switch (CodePage) {
+    case EBCDICCodePage::IBM037:
+      if (Byte == 0 || Byte == '\t' || Byte == '\n' || Byte == '\r')
+        return true;
+      if ((Byte >= '0' && Byte <= '9') || (Byte >= 'A' && Byte <= 'Z') ||
+          (Byte >= 'a' && Byte <= 'z'))
+        return true;
+
+      switch (Byte) {
+      case ' ':
+      case '!':
+      case '"':
+      case '#':
+      case '$':
+      case '%':
+      case '&':
+      case '\'':
+      case '(':
+      case ')':
+      case '*':
+      case '+':
+      case ',':
+      case '-':
+      case '.':
+      case '/':
+      case ':':
+      case ';':
+      case '<':
+      case '=':
+      case '>':
+      case '?':
+      case '@':
+      case '[':
+      case '\\':
+      case ']':
+      case '^':
+      case '_':
+      case '`':
+      case '{':
+      case '|':
+      case '}':
+      case '~':
+        return true;
+      default:
+        return false;
+      }
+    }
+    llvm_unreachable("unknown EBCDIC code page");
+  }
+
+  static uint8_t getEBCDICBlankByte(EBCDICCodePage CodePage) {
+    return encodeEBCDICByte(' ', CodePage);
+  }
+
+  static std::string encodeEBCDICHex(StringRef Bytes,
+                                     EBCDICCodePage CodePage) {
+    std::string Hex;
+    const char Digits[] = "0123456789ABCDEF";
+    for (uint8_t Byte : Bytes.bytes()) {
+      uint8_t Encoded = encodeEBCDICByte(Byte, CodePage);
+      Hex.push_back(Digits[Encoded >> 4]);
+      Hex.push_back(Digits[Encoded & 0x0F]);
+    }
+    return Hex;
+  }
+
   struct SourceLocationRecord {
     std::string File;
     std::optional<unsigned> Line;
@@ -629,170 +817,15 @@ class OS400MIEmitPass : public ModulePass {
       return "";
     }
 
-    static uint8_t encodeCP37Byte(uint8_t Byte) {
-      if (Byte == 0)
-        return 0;
-
-      switch (Byte) {
-      case '\t':
-        return 0x05;
-      case '\n':
-        return 0x25;
-      case '\r':
-        return 0x0D;
-      case ' ':
-        return 0x40;
-      case '!':
-        return 0x5A;
-      case '"':
-        return 0x7F;
-      case '#':
-        return 0x7B;
-      case '$':
-        return 0x5B;
-      case '%':
-        return 0x6C;
-      case '&':
-        return 0x50;
-      case '\'':
-        return 0x7D;
-      case '(':
-        return 0x4D;
-      case ')':
-        return 0x5D;
-      case '*':
-        return 0x5C;
-      case '+':
-        return 0x4E;
-      case ',':
-        return 0x6B;
-      case '-':
-        return 0x60;
-      case '.':
-        return 0x4B;
-      case '/':
-        return 0x61;
-      case ':':
-        return 0x7A;
-      case ';':
-        return 0x5E;
-      case '<':
-        return 0x4C;
-      case '=':
-        return 0x7E;
-      case '>':
-        return 0x6E;
-      case '?':
-        return 0x6F;
-      case '@':
-        return 0x7C;
-      case '[':
-        return 0xBA;
-      case '\\':
-        return 0xE0;
-      case ']':
-        return 0xBB;
-      case '^':
-        return 0xB0;
-      case '_':
-        return 0x6D;
-      case '`':
-        return 0x79;
-      case '{':
-        return 0xC0;
-      case '|':
-        return 0x4F;
-      case '}':
-        return 0xD0;
-      case '~':
-        return 0xA1;
-      default:
-        break;
-      }
-
-      if (Byte >= '0' && Byte <= '9')
-        return 0xF0 + (Byte - '0');
-      if (Byte >= 'A' && Byte <= 'I')
-        return 0xC1 + (Byte - 'A');
-      if (Byte >= 'J' && Byte <= 'R')
-        return 0xD1 + (Byte - 'J');
-      if (Byte >= 'S' && Byte <= 'Z')
-        return 0xE2 + (Byte - 'S');
-      if (Byte >= 'a' && Byte <= 'i')
-        return 0x81 + (Byte - 'a');
-      if (Byte >= 'j' && Byte <= 'r')
-        return 0x91 + (Byte - 'j');
-      if (Byte >= 's' && Byte <= 'z')
-        return 0xA2 + (Byte - 's');
-
-      fail("ASCII string literal bytes representable as IBM-037");
-      llvm_unreachable("fail should not return");
-    }
-
-    static bool canEncodeCP37Byte(uint8_t Byte) {
-      if (Byte == 0 || Byte == '\t' || Byte == '\n' || Byte == '\r')
-        return true;
-      if ((Byte >= '0' && Byte <= '9') || (Byte >= 'A' && Byte <= 'Z') ||
-          (Byte >= 'a' && Byte <= 'z'))
-        return true;
-
-      switch (Byte) {
-      case ' ':
-      case '!':
-      case '"':
-      case '#':
-      case '$':
-      case '%':
-      case '&':
-      case '\'':
-      case '(':
-      case ')':
-      case '*':
-      case '+':
-      case ',':
-      case '-':
-      case '.':
-      case '/':
-      case ':':
-      case ';':
-      case '<':
-      case '=':
-      case '>':
-      case '?':
-      case '@':
-      case '[':
-      case '\\':
-      case ']':
-      case '^':
-      case '_':
-      case '`':
-      case '{':
-      case '|':
-      case '}':
-      case '~':
-        return true;
-      default:
-        return false;
-      }
-    }
-
-    static bool isCP37StringLiteral(const ConstantDataArray &CDA) {
+    static bool isEBCDICStringLiteral(const ConstantDataArray &CDA,
+                                      EBCDICCodePage CodePage) {
       if (!CDA.isCString())
         return false;
 
       StringRef Bytes = CDA.getAsString();
-      return llvm::all_of(Bytes.bytes(), canEncodeCP37Byte);
-    }
-
-    static std::string encodeCP37Hex(StringRef Bytes) {
-      std::string Hex;
-      const char Digits[] = "0123456789ABCDEF";
-      for (uint8_t Byte : Bytes.bytes()) {
-        uint8_t Encoded = encodeCP37Byte(Byte);
-        Hex.push_back(Digits[Encoded >> 4]);
-        Hex.push_back(Digits[Encoded & 0x0F]);
-      }
-      return Hex;
+      return llvm::all_of(Bytes.bytes(), [CodePage](uint8_t Byte) {
+        return canEncodeEBCDICByte(Byte, CodePage);
+      });
     }
 
     void addMapRecord(const GeneratedName &Name, std::string Kind,
@@ -1019,7 +1052,9 @@ class OS400MIEmitPass : public ModulePass {
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createLiteralName(Original);
-      std::string Hex = encodeCP37Hex(Bytes);
+      EBCDICCodePage CodePage = DefaultEBCDICCodePage;
+      std::string Encoding = getEBCDICEncodingName(CodePage).str();
+      std::string Hex = encodeEBCDICHex(Bytes, CodePage);
       Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
                              std::to_string(Size) +
                              ")    DEF(C_MEM) POS(" +
@@ -1028,8 +1063,8 @@ class OS400MIEmitPass : public ModulePass {
                       false);
       std::optional<SourceLocationRecord> Loc = getSourceLocation(GV);
       addMapRecord(Name, "string", std::move(Original), Offset, Size, 1,
-                   Loc, "ibm-037");
-      appendChunkedHexInitializers(Name, Hex, Offset, Size, Loc, "ibm-037");
+                   Loc, Encoding);
+      appendChunkedHexInitializers(Name, Hex, Offset, Size, Loc, Encoding);
       NextArenaOffset = Offset + Size;
     }
 
@@ -1086,7 +1121,7 @@ class OS400MIEmitPass : public ModulePass {
         const auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
         const auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
         if (ArrayTy && ArrayTy->getElementType()->isIntegerTy(8) && CDA &&
-            isCP37StringLiteral(*CDA)) {
+            isEBCDICStringLiteral(*CDA, DefaultEBCDICCodePage)) {
           layoutStringGlobal(GV, *CDA);
           continue;
         }
@@ -1433,7 +1468,7 @@ class OS400MIEmitPass : public ModulePass {
     bool HasNativeByteLens = false;
     bool HasNativeSept = false;
     bool HasNativeNull = false;
-    bool HasNativeQsysprt = false;
+    bool HasNativeUfcb = false;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
     static bool isPTR32(Type *Ty) { return Ty && Ty->isPointerTy(); }
@@ -1684,11 +1719,11 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     SPCPTR      .NULL;");
     }
 
-    void ensureNativeQsysprt() {
-      if (HasNativeQsysprt)
+    void ensureNativeUfcb() {
+      if (HasNativeUfcb)
         return;
 
-      HasNativeQsysprt = true;
+      HasNativeUfcb = true;
       ensureNativeNull();
       Declarations.push_back("DCL     SPCPTR      .ODP;");
       Declarations.push_back("DCL     SPC         ODP       BAS(.ODP);");
@@ -1719,11 +1754,14 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     SPCPTR      .OFCB-IOFB   DEF(OFCB) POS(65);");
       Declarations.push_back("DCL     SPCPTR      .OFCB-NEXT   DEF(OFCB) POS(81);");
       Declarations.push_back("DCL     DD          *            CHAR(32) DEF(OFCB) POS(97);");
-      Declarations.push_back("DCL     DD          OFCB-FILE    CHAR(10) DEF(OFCB) POS(129) INIT(\"QSYSPRT\");");
+      Declarations.push_back("DCL     DD          OFCB-FILE    CHAR(10) DEF(OFCB) POS(129);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-FILE INIT(OFCB-FILE);");
       Declarations.push_back("DCL     DD          OFCB-LIB-ID  BIN(2) DEF(OFCB) POS(139) INIT(-75);");
-      Declarations.push_back("DCL     DD          OFCB-LIBRARY CHAR(10) DEF(OFCB) POS(141) INIT(\"*LIBL\");");
+      Declarations.push_back("DCL     DD          OFCB-LIBRARY CHAR(10) DEF(OFCB) POS(141);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-LIBRARY INIT(OFCB-LIBRARY);");
       Declarations.push_back("DCL     DD          OFCB-MBR-ID  BIN(2) DEF(OFCB) POS(151) INIT(-71);");
-      Declarations.push_back("DCL     DD          OFCB-MEMBER  CHAR(10) DEF(OFCB) POS(153) INIT(\"*FIRST\");");
+      Declarations.push_back("DCL     DD          OFCB-MEMBER  CHAR(10) DEF(OFCB) POS(153);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-MEMBER INIT(OFCB-MEMBER);");
       Declarations.push_back("DCL     DD          OFCB-DEV-NAME CHAR(10) DEF(OFCB) POS(163);");
       Declarations.push_back("DCL     DD          OFCB-DEV-IDX BIN(2) DEF(OFCB) POS(173);");
       Declarations.push_back("DCL     DD          OFCB-FLAGS-1 CHAR(1) DEF(OFCB) POS(175) INIT(X'80');");
@@ -3197,25 +3235,49 @@ class OS400MIEmitPass : public ModulePass {
       if (!Name.starts_with("llvm.os400mi."))
         return false;
 
-      if (Name == "llvm.os400mi.ufcb.qsysprt") {
+      if (Name == "llvm.os400mi.ufcb") {
         if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
-          fail("OS400MI ufcb_qsysprt builtin signature");
-        ensureNativeQsysprt();
+          fail("OS400MI ufcb builtin signature");
+        ensureNativeUfcb();
         NativePtrValues[&CB] = ".OFCB";
         return true;
       }
       if (Name == "llvm.os400mi.ufcb.outbuf") {
         if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
           fail("OS400MI ufcb_outbuf builtin signature");
-        ensureNativeQsysprt();
+        ensureNativeUfcb();
         (void)getNativePtrName(CB.getArgOperand(0));
         NativePtrValues[&CB] = ".OFCB-OUTBUF";
+        return true;
+      }
+      if (Name == "llvm.os400mi.ufcb.file") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_file builtin signature");
+        ensureNativeUfcb();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        NativePtrValues[&CB] = ".OFCB-FILE";
+        return true;
+      }
+      if (Name == "llvm.os400mi.ufcb.library") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_library builtin signature");
+        ensureNativeUfcb();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        NativePtrValues[&CB] = ".OFCB-LIBRARY";
+        return true;
+      }
+      if (Name == "llvm.os400mi.ufcb.member") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_member builtin signature");
+        ensureNativeUfcb();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        NativePtrValues[&CB] = ".OFCB-MEMBER";
         return true;
       }
       if (Name == "llvm.os400mi.ufcb.odp") {
         if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
           fail("OS400MI ufcb_odp builtin signature");
-        ensureNativeQsysprt();
+        ensureNativeUfcb();
         (void)getNativePtrName(CB.getArgOperand(0));
         Body.push_back("        CPYBWP      .ODP,.OFCB-ODP;");
         NativePtrValues[&CB] = ".ODP";
@@ -3224,7 +3286,7 @@ class OS400MIEmitPass : public ModulePass {
       if (Name == "llvm.os400mi.odp.dcb.put") {
         if (CB.arg_size() != 1 || !CB.getType()->isIntegerTy(16))
           fail("OS400MI odp_dcb_put builtin signature");
-        ensureNativeQsysprt();
+        ensureNativeUfcb();
         (void)getNativePtrName(CB.getArgOperand(0));
         Body.push_back("        ADDSPP      .DCB,.ODP,ODP-DCB;");
         Body.push_back("        CPYNV       PUT-ENTRY,DCB-PUT;");
@@ -3260,7 +3322,7 @@ class OS400MIEmitPass : public ModulePass {
       if (Name == "llvm.os400mi.dm.put.wait.option") {
         if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
           fail("OS400MI dm_put_wait_option builtin signature");
-        ensureNativeQsysprt();
+        ensureNativeUfcb();
         NativePtrValues[&CB] = ".PUTOPT";
         return true;
       }
@@ -3274,6 +3336,17 @@ class OS400MIEmitPass : public ModulePass {
       if (Name == "llvm.os400mi.char.from.cstr") {
         if (CB.arg_size() != 3 || !CB.getType()->isVoidTy())
           fail("OS400MI char_from_cstr builtin signature");
+        emitNativeCharFromCstr(CB.getArgOperand(0), CB.getArgOperand(1),
+                               CB.getArgOperand(2));
+        return true;
+      }
+      if (Name == "llvm.os400mi.char.from.cstr.blank.padded") {
+        if (CB.arg_size() != 3 || !CB.getType()->isVoidTy())
+          fail("OS400MI char_from_cstr_blank_padded builtin signature");
+        emitNativeCharFill(CB.getArgOperand(0), CB.getArgOperand(1),
+                           ConstantInt::get(Type::getInt32Ty(CB.getContext()),
+                                            getEBCDICBlankByte(
+                                                DefaultEBCDICCodePage)));
         emitNativeCharFromCstr(CB.getArgOperand(0), CB.getArgOperand(1),
                                CB.getArgOperand(2));
         return true;

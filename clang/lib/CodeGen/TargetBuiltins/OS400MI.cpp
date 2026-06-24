@@ -37,10 +37,16 @@ llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
     Args.push_back(EmitScalarExpr(Arg));
 
   switch (BuiltinID) {
-  case OS400MI::BI__builtin_os400mi_ufcb_qsysprt:
-    return emitOS400MICall(*this, "llvm.os400mi.ufcb.qsysprt", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_ufcb_outbuf:
     return emitOS400MICall(*this, "llvm.os400mi.ufcb.outbuf", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb_file:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.file", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb_library:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.library", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb_member:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.member", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_ufcb_odp:
     return emitOS400MICall(*this, "llvm.os400mi.ufcb.odp", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_odp_dcb_put:
@@ -59,6 +65,9 @@ llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
   case OS400MI::BI__builtin_os400mi_char_from_cstr:
     return emitOS400MICall(*this, "llvm.os400mi.char.from.cstr", RetVoidTy,
                            Args);
+  case OS400MI::BI__builtin_os400mi_char_from_cstr_blank_padded:
+    return emitOS400MICall(*this, "llvm.os400mi.char.from.cstr.blank.padded",
+                           RetVoidTy, Args);
   case OS400MI::BI__builtin_os400mi_callx0:
     return emitOS400MICall(*this, "llvm.os400mi.callx.0", RetVoidTy, Args);
   case OS400MI::BI__builtin_os400mi_callx1:

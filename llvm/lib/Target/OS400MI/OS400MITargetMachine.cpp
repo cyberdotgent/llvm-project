@@ -1457,6 +1457,8 @@ class OS400MIEmitPass : public ModulePass {
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const Value *, I64CompareValue> I64Comparisons;
     DenseMap<const AllocaInst *, ArenaSlot> Slots;
+    DenseMap<const AllocaInst *, std::string> NativePtrSlots;
+    DenseMap<const AllocaInst *, std::string> NativeOperandListSlots;
     DenseMap<const BasicBlock *, std::string> BlockLabels;
     DenseMap<const BasicBlock *, SmallVector<const PHINode *, 2>> BlockPHIs;
     SmallVector<std::string, 8> Declarations;
@@ -1861,6 +1863,10 @@ class OS400MIEmitPass : public ModulePass {
       if (!It->second.DirectScalar)
         return std::nullopt;
       return It->second;
+    }
+
+    const AllocaInst *getDirectAlloca(const Value *V) const {
+      return dyn_cast<AllocaInst>(V->stripPointerCasts());
     }
 
     std::string createTemp(const Value &V) {
@@ -3915,6 +3921,30 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerStore(const StoreInst &SI) {
       Type *ValueTy = SI.getValueOperand()->getType();
+      if (ValueTy->isPointerTy()) {
+        if (const AllocaInst *AI = getDirectAlloca(SI.getPointerOperand())) {
+          auto NativePtrIt = NativePtrValues.find(SI.getValueOperand());
+          auto NativeOLIt = NativeOperandLists.find(SI.getValueOperand());
+          if (NativePtrIt != NativePtrValues.end()) {
+            if (NativeOperandListSlots.contains(AI))
+              fail("native MI pointer and operand-list values in separate "
+                   "spill slots");
+            NativePtrSlots[AI] = NativePtrIt->second;
+            return;
+          }
+          if (NativeOLIt != NativeOperandLists.end()) {
+            if (NativePtrSlots.contains(AI))
+              fail("native MI pointer and operand-list values in separate "
+                   "spill slots");
+            NativeOperandListSlots[AI] = NativeOLIt->second;
+            return;
+          }
+          if (NativePtrSlots.contains(AI) ||
+              NativeOperandListSlots.contains(AI))
+            fail("native MI handle spill slots cannot hold C arena pointers");
+        }
+      }
+
       if (ValueTy->isIntegerTy(64)) {
         I64Value Source = getI64Operand(SI.getValueOperand());
         emitStoreI64ToOffset(getPointerOffsetName(SI.getPointerOperand()),
@@ -3953,6 +3983,21 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerLoad(const LoadInst &LI) {
+      if (LI.getType()->isPointerTy()) {
+        if (const AllocaInst *AI = getDirectAlloca(LI.getPointerOperand())) {
+          auto NativePtrIt = NativePtrSlots.find(AI);
+          auto NativeOLIt = NativeOperandListSlots.find(AI);
+          if (NativePtrIt != NativePtrSlots.end()) {
+            NativePtrValues[&LI] = NativePtrIt->second;
+            return;
+          }
+          if (NativeOLIt != NativeOperandListSlots.end()) {
+            NativeOperandLists[&LI] = NativeOLIt->second;
+            return;
+          }
+        }
+      }
+
       if (LI.getType()->isIntegerTy(64)) {
         I64Value Dest = createI64Temp(LI);
         emitLoadI64FromOffset(Dest, getPointerOffsetName(LI.getPointerOperand()));
@@ -4398,6 +4443,8 @@ class OS400MIEmitPass : public ModulePass {
       AggregateValues.clear();
       NativePtrValues.clear();
       NativeOperandLists.clear();
+      NativePtrSlots.clear();
+      NativeOperandListSlots.clear();
       SignedNarrowValues.clear();
       Comparisons.clear();
       I64Comparisons.clear();

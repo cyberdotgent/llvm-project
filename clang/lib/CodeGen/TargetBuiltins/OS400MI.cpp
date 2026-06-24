@@ -82,6 +82,12 @@ llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
   case OS400MI::BI__builtin_os400mi_char_to_cstr:
     return emitOS400MICall(*this, "llvm.os400mi.char.to.cstr", RetVoidTy,
                            Args);
+  case OS400MI::BI__builtin_os400mi_runtime_startup:
+    return emitOS400MICall(*this, "llvm.os400mi.runtime.startup", RetVoidTy,
+                           Args);
+  case OS400MI::BI__builtin_os400mi_runtime_terminate:
+    return emitOS400MICall(*this, "llvm.os400mi.runtime.terminate", IntTy,
+                           Args);
   case OS400MI::BI__builtin_os400mi_ol0:
     return emitOS400MICall(*this, "llvm.os400mi.ol.0", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_ol1:

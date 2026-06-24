@@ -1198,18 +1198,22 @@ class OS400MIEmitPass : public ModulePass {
       return "";
     }
 
-    static bool isSupportedCallABIType(Type *Ty) {
+    static bool isSupportedParamABIType(Type *Ty) {
       return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
              Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
              Ty->isIntegerTy(64) || Ty->isPointerTy() ||
              isSupportedArenaValueType(Ty);
     }
 
+    static bool isSupportedReturnABIType(Type *Ty) {
+      return Ty->isVoidTy() || isSupportedParamABIType(Ty);
+    }
+
     static bool isSupportedCallType(const FunctionType *Ty) {
-      if (Ty->isVarArg() || !isSupportedCallABIType(Ty->getReturnType()))
+      if (Ty->isVarArg() || !isSupportedReturnABIType(Ty->getReturnType()))
         return false;
       for (Type *ParamTy : Ty->params()) {
-        if (!isSupportedCallABIType(ParamTy))
+        if (!isSupportedParamABIType(ParamTy))
           return false;
       }
       return true;
@@ -1227,6 +1231,9 @@ class OS400MIEmitPass : public ModulePass {
 
     static void declareSlot(SmallVectorImpl<std::string> &Declarations,
                             const FunctionInfo::Slot &Slot) {
+      if (Slot.Ty->isVoidTy())
+        return;
+
       if (Slot.Ty->isIntegerTy(64)) {
         appendI64Declarations(Declarations, Slot.I64);
         return;
@@ -1256,6 +1263,8 @@ class OS400MIEmitPass : public ModulePass {
       FunctionInfo::Slot Slot;
       Slot.Ty = Ty;
       Slot.Name = Name.str();
+      if (Ty->isVoidTy())
+        return Slot;
       if (isI64Slot(Ty))
         Slot.I64 = makeI64Value(Name);
       if (isAggregateSlot(Ty)) {
@@ -1352,7 +1361,8 @@ class OS400MIEmitPass : public ModulePass {
 
       if (!isSupportedCallType(Ty))
         fail("non-varargs direct calls between functions using "
-             "i1/i8/i16/i32/i64/PTR32 arguments and returns");
+             "i1/i8/i16/i32/i64/PTR32 arguments and void or matching "
+             "i1/i8/i16/i32/i64/PTR32 returns");
     }
 
     void visitFunction(const Function &F, bool IsEntry) {
@@ -3609,6 +3619,17 @@ class OS400MIEmitPass : public ModulePass {
                              CB.getArgOperand(2));
         return true;
       }
+      if (Name == "llvm.os400mi.runtime.startup") {
+        if (CB.arg_size() != 0 || !CB.getType()->isVoidTy())
+          fail("OS400MI runtime_startup builtin signature");
+        return true;
+      }
+      if (Name == "llvm.os400mi.runtime.terminate") {
+        if (CB.arg_size() != 1 || !CB.getType()->isIntegerTy(32))
+          fail("OS400MI runtime_terminate builtin signature");
+        Values[&CB] = getOperandName(CB.getArgOperand(0));
+        return true;
+      }
       if (Name.starts_with("llvm.os400mi.ol.")) {
         unsigned Arity = 0;
         StringRef Suffix = Name;
@@ -4318,11 +4339,13 @@ class OS400MIEmitPass : public ModulePass {
              "definition or explicit OS400MI CALLX builtins");
 
       const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
-      if (!(CB.getType()->isIntegerTy(1) || CB.getType()->isIntegerTy(8) ||
+      if (!(CB.getType()->isVoidTy() || CB.getType()->isIntegerTy(1) ||
+            CB.getType()->isIntegerTy(8) ||
             CB.getType()->isIntegerTy(16) || CB.getType()->isIntegerTy(32) ||
             CB.getType()->isIntegerTy(64) || CB.getType()->isPointerTy() ||
             isAggregateABIType(CB.getType())))
-        fail("direct i1/i8/i16/i32/i64/PTR32/aggregate function call results");
+        fail("direct void/i1/i8/i16/i32/i64/PTR32/aggregate function call "
+             "results");
       if (CB.arg_size() != CalleeInfo.Args.size())
         fail("direct function call arguments matching callee signature");
 
@@ -4351,6 +4374,9 @@ class OS400MIEmitPass : public ModulePass {
       invalidateCallAliasedMemory(CB, CalleeInfo);
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
+      if (CB.getType()->isVoidTy())
+        return;
+
       if (CB.getType()->isIntegerTy(64)) {
         I64Value Dest = createI64Temp(CB, "call_result");
         Body.push_back("        CPYBLA      " + Dest.Bytes + "," +
@@ -4376,6 +4402,14 @@ class OS400MIEmitPass : public ModulePass {
 
     void lowerReturn(const ReturnInst &RI) {
       Value *Ret = RI.getReturnValue();
+      if (CurrentFunction->ReturnSlot.Ty->isVoidTy()) {
+        if (Ret)
+          fail("returns matching lowered function signature");
+        Body.push_back("        B           " +
+                       CurrentFunction->ReturnPointerName + ";");
+        return;
+      }
+
       if (!Ret || Ret->getType() != CurrentFunction->ReturnSlot.Ty)
         fail("returns matching lowered function signature");
       if (Ret->getType()->isIntegerTy(64)) {

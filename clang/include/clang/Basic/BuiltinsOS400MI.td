@@ -94,6 +94,14 @@ def CharToCstr : OS400MIBuiltin<"void(char *, unsigned int, void *)"> {
   let Spellings = ["__builtin_os400mi_char_to_cstr"];
 }
 
+def RuntimeStartup : OS400MIBuiltin<"void()"> {
+  let Spellings = ["__builtin_os400mi_runtime_startup"];
+}
+
+def RuntimeTerminate : OS400MIBuiltin<"int(int)"> {
+  let Spellings = ["__builtin_os400mi_runtime_terminate"];
+}
+
 def Ol0 : OS400MIBuiltin<"void *()"> {
   let Spellings = ["__builtin_os400mi_ol0"];
 }

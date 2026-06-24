@@ -25,6 +25,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -141,6 +142,35 @@ class OS400MIEmitPass : public ModulePass {
       }
     }
     OS << '"';
+  }
+
+  static void appendRawAsmLines(SmallVectorImpl<std::string> &Output,
+                                StringRef Asm, bool RejectEmpty = false) {
+    SmallVector<StringRef, 8> Lines;
+    Asm.split(Lines, '\n');
+    for (StringRef Line : Lines) {
+      Line = Line.rtrim("\r");
+      if (Line.empty()) {
+        if (RejectEmpty)
+          fail("non-empty OS400MI inline asm lines");
+        continue;
+      }
+      Output.push_back(Line.str());
+    }
+  }
+
+  static void validateRawInlineAsm(const CallBase &CB) {
+    const auto *IA = dyn_cast<InlineAsm>(CB.getCalledOperand());
+    if (!IA)
+      fail("inline asm call operand");
+    if (!CB.getType()->isVoidTy() || CB.arg_size() != 0)
+      fail("constraint-free void OS400MI inline asm");
+    if (!IA->getConstraintString().empty())
+      fail("constraint-free OS400MI inline asm");
+    if (IA->canThrow())
+      fail("non-unwinding OS400MI inline asm");
+    if (isa<CallBrInst>(CB))
+      fail("OS400MI inline asm without asm-goto labels");
   }
 
   struct SourceLocationRecord {
@@ -1262,6 +1292,11 @@ class OS400MIEmitPass : public ModulePass {
           const auto *CB = dyn_cast<CallBase>(&I);
           if (!CB)
             continue;
+
+          if (CB->isInlineAsm()) {
+            validateRawInlineAsm(*CB);
+            continue;
+          }
 
           if (CB->isIndirectCall())
             fail("direct function calls; indirect calls require a function "
@@ -3500,6 +3535,13 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerCall(const CallBase &CB) {
+      if (CB.isInlineAsm()) {
+        validateRawInlineAsm(CB);
+        const auto *IA = cast<InlineAsm>(CB.getCalledOperand());
+        appendRawAsmLines(Body, IA->getAsmString());
+        return;
+      }
+
       if (CB.isIndirectCall())
         fail("direct function calls; indirect calls require a function pointer "
              "ABI");
@@ -3768,8 +3810,13 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
   };
 
-  void emitProgram(const ArenaLayout &Layout, const ModuleFunctionPlan &Plan,
+  void emitProgram(const Module &M, const ArenaLayout &Layout,
+                   const ModuleFunctionPlan &Plan,
                    const FunctionLowerer &Lowerer) {
+    SmallVector<std::string, 16> ModuleAsmLines;
+    appendRawAsmLines(ModuleAsmLines, M.getModuleInlineAsm());
+    for (const std::string &Line : ModuleAsmLines)
+      OS << Line << "\n";
     OS << "DCL     SPCPTR      ARGC@      PARM;\n";
     OS << "DCL     SPCPTR      ARGV@      PARM;\n";
     OS << "DCL     OL          PARM_LIST\n";
@@ -3937,7 +3984,7 @@ public:
     FunctionLowerer Lowerer(M.getDataLayout(), Layout, FunctionPlan, Names);
     for (const Function *F : FunctionPlan.getFunctions())
       Lowerer.lower(*F);
-    emitProgram(Layout, FunctionPlan, Lowerer);
+    emitProgram(M, Layout, FunctionPlan, Lowerer);
     emitMapFile(Layout, FunctionPlan, Lowerer);
     return false;
   }

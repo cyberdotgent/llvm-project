@@ -167,6 +167,8 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   std::string Stem = std::string(llvm::sys::path::stem(Output.getFilename()));
   const char *LinkedBC =
       C.getDriver().CreateTempFile(C, Stem + "-os400mi-link", "bc", false);
+  const char *OptimizedBC =
+      C.getDriver().CreateTempFile(C, Stem + "-os400mi-opt", "bc", false);
 
   ArgStringList LlvmLinkArgs({"-o", LinkedBC, "--only-needed"});
   LlvmLinkArgs.append(LinkArgs);
@@ -177,18 +179,30 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                          LlvmLink, LlvmLinkArgs, Inputs,
                                          Output));
 
+  ArgStringList OptArgs;
+  OptArgs.push_back("-o");
+  OptArgs.push_back(OptimizedBC);
+  OptArgs.push_back("-passes=internalize,globaldce");
+  OptArgs.push_back("-internalize-public-api-list=_start,main");
+  OptArgs.push_back(LinkedBC);
+
+  const char *Opt = Args.MakeArgString(getToolChain().GetProgramPath("opt"));
+  InputInfo LinkedInput(types::TY_LLVM_BC, LinkedBC, "");
+  C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
+                                         Opt, OptArgs, LinkedInput, Output));
+
   ArgStringList LlcArgs;
   LlcArgs.push_back(
       Args.MakeArgString("-mtriple=" + getToolChain().getTripleString()));
   LlcArgs.push_back("-filetype=asm");
   LlcArgs.push_back("-o");
   LlcArgs.push_back(Output.getFilename());
-  LlcArgs.push_back(LinkedBC);
+  LlcArgs.push_back(OptimizedBC);
 
   const char *Llc = Args.MakeArgString(getToolChain().GetProgramPath("llc"));
-  InputInfo LinkedInput(types::TY_LLVM_BC, LinkedBC, "");
+  InputInfo OptimizedInput(types::TY_LLVM_BC, OptimizedBC, "");
   C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
-                                         Llc, LlcArgs, LinkedInput, Output));
+                                         Llc, LlcArgs, OptimizedInput, Output));
 }
 
 OS400MI::OS400MI(const Driver &D, const llvm::Triple &Triple,

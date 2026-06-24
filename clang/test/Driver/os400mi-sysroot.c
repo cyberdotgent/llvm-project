@@ -14,10 +14,13 @@
 // LINK-SAME: "{{.*}}crt0.o"
 // LINK-SAME: "{{.*}}libc.a"
 // LINK-SAME: "{{.*}}libos400mi.a"
+// LINK: "{{.*}}opt"
+// LINK-SAME: "-passes=internalize,globaldce"
 // LINK: "{{.*}}llc"
 
 // FREESTANDING: "{{.*}}llvm-link"
 // FREESTANDING-NOT: "crt0.o"
 // FREESTANDING-NOT: "libc.a"
 // FREESTANDING-NOT: "libos400mi.a"
+// FREESTANDING: "{{.*}}opt"
 // FREESTANDING: "{{.*}}llc"

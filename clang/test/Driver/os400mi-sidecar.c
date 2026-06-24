@@ -16,14 +16,20 @@
 // LINK: "-cc1"
 // LINK-SAME: "-emit-llvm-bc"
 // LINK: "{{.*}}llvm-link"
-// LINK-SAME: "-o" "{{.*}}os400mi-link{{.*}}.bc"
+// LINK-SAME: "-o" "{{[^"]*}}os400mi-link{{[^"]*}}.bc"
+// LINK: "{{.*}}opt"
+// LINK-SAME: "-o" "{{[^"]*}}os400mi-opt{{[^"]*}}.bc"
+// LINK-SAME: "-passes=internalize,globaldce"
+// LINK-SAME: "-internalize-public-api-list=_start,main"
 // LINK: "{{.*}}llc"
 // LINK-SAME: "-mtriple=os400mi-ibm-os400"
 // LINK-SAME: "-filetype=asm"
 // LINK-SAME: "-o" "{{.*}}.mi"
+// LINK-SAME: "{{[^"]*}}os400mi-opt{{[^"]*}}.bc"
 
 // LIB: "{{.*}}llvm-link"
 // LIB-SAME: "{{.*}}libio.a"
+// LIB: "{{.*}}opt"
 // LIB: "{{.*}}llc"
 
 int main(void) { return 0; }

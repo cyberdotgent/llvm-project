@@ -52,6 +52,8 @@ public:
   }
   bool isPICDefaultForced() const override { return false; }
   bool SupportsProfiling() const override { return false; }
+  void AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
+                                 llvm::opt::ArgStringList &CC1Args) const override;
   LTOKind getDefaultLTOMode() const override { return LTOK_Full; }
   LTOKind getLTOMode(const llvm::opt::ArgList &Args,
                      Action::OffloadKind Kind = Action::OFK_None) const override;

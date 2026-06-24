@@ -23,6 +23,34 @@ using namespace clang::driver::toolchains;
 using namespace clang::driver::tools;
 using namespace llvm::opt;
 
+static void addIfExists(const ArgList &DriverArgs, ArgStringList &CC1Args,
+                        llvm::StringRef Path) {
+  if (!llvm::sys::fs::exists(Path))
+    return;
+  ToolChain::addSystemInclude(DriverArgs, CC1Args, Path);
+}
+
+static void addOS400MISysRootIncludePaths(const ToolChain &TC,
+                                          const ArgList &DriverArgs,
+                                          ArgStringList &CC1Args) {
+  llvm::SmallVector<std::string, 4> IncludePaths;
+  std::string SysRoot = TC.computeSysRoot();
+  if (SysRoot.empty())
+    return;
+
+  llvm::SmallString<256> TooldirInclude(SysRoot);
+  llvm::sys::path::append(TooldirInclude, "usr", "local", "os400mi-ibm-os400",
+                          "include");
+  IncludePaths.push_back(std::string(TooldirInclude));
+
+  llvm::SmallString<256> RootInclude(SysRoot);
+  llvm::sys::path::append(RootInclude, "include");
+  IncludePaths.push_back(std::string(RootInclude));
+
+  for (const std::string &Path : IncludePaths)
+    addIfExists(DriverArgs, CC1Args, Path);
+}
+
 static std::string getOS400MIArchiveName(llvm::StringRef LibName) {
   llvm::SmallString<128> FileName;
   if (LibName.starts_with(":")) {
@@ -117,6 +145,25 @@ OS400MI::OS400MI(const Driver &D, const llvm::Triple &Triple,
                  const ArgList &Args)
     : ToolChain(D, Triple, Args) {
   getProgramPaths().push_back(getDriver().Dir);
+
+  std::string SysRoot = computeSysRoot();
+  if (!SysRoot.empty()) {
+    llvm::SmallString<256> LibDir(SysRoot);
+    llvm::sys::path::append(LibDir, "usr", "local", "os400mi-ibm-os400",
+                            "lib");
+    if (llvm::sys::fs::exists(LibDir))
+      getFilePaths().push_back(std::string(LibDir));
+
+    llvm::SmallString<256> RootLib(SysRoot);
+    llvm::sys::path::append(RootLib, "lib");
+    if (llvm::sys::fs::exists(RootLib))
+      getFilePaths().push_back(std::string(RootLib));
+  }
+}
+
+void OS400MI::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
+                                        ArgStringList &CC1Args) const {
+  addOS400MISysRootIncludePaths(*this, DriverArgs, CC1Args);
 }
 
 LTOKind OS400MI::getLTOMode(const ArgList &Args,

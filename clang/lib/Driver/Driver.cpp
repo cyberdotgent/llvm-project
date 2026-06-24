@@ -40,6 +40,7 @@
 #include "ToolChains/NetBSD.h"
 #include "ToolChains/OHOS.h"
 #include "ToolChains/OpenBSD.h"
+#include "ToolChains/OS400MI.h"
 #include "ToolChains/PPCFreeBSD.h"
 #include "ToolChains/PPCLinux.h"
 #include "ToolChains/PS4CPU.h"
@@ -7214,6 +7215,9 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
         break;
       case llvm::Triple::msp430:
         TC = std::make_unique<toolchains::MSP430ToolChain>(*this, Target, Args);
+        break;
+      case llvm::Triple::os400mi:
+        TC = std::make_unique<toolchains::OS400MI>(*this, Target, Args);
         break;
       case llvm::Triple::riscv32:
       case llvm::Triple::riscv64:

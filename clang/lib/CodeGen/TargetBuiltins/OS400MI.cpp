@@ -53,10 +53,21 @@ llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
     return emitOS400MICall(*this, "llvm.os400mi.odp.dcb.put", I16Ty, Args);
   case OS400MI::BI__builtin_os400mi_sysptr_sept:
     return emitOS400MICall(*this, "llvm.os400mi.sysptr.sept", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_sysptr_program:
+    return emitOS400MICall(*this, "llvm.os400mi.sysptr.program", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_spcptr_null:
     return emitOS400MICall(*this, "llvm.os400mi.spcptr.null", PtrTy, Args);
   case OS400MI::BI__builtin_os400mi_spcptr_add:
     return emitOS400MICall(*this, "llvm.os400mi.spcptr.add", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_native_char:
+    return emitOS400MICall(*this, "llvm.os400mi.native.char", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_native_bin4:
+    return emitOS400MICall(*this, "llvm.os400mi.native.bin4", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_native_bin4_set:
+    return emitOS400MICall(*this, "llvm.os400mi.native.bin4.set", RetVoidTy,
+                           Args);
+  case OS400MI::BI__builtin_os400mi_native_bin4_get:
+    return emitOS400MICall(*this, "llvm.os400mi.native.bin4.get", IntTy, Args);
   case OS400MI::BI__builtin_os400mi_dm_put_wait_option:
     return emitOS400MICall(*this, "llvm.os400mi.dm.put.wait.option", PtrTy,
                            Args);
@@ -68,6 +79,29 @@ llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
   case OS400MI::BI__builtin_os400mi_char_from_cstr_blank_padded:
     return emitOS400MICall(*this, "llvm.os400mi.char.from.cstr.blank.padded",
                            RetVoidTy, Args);
+  case OS400MI::BI__builtin_os400mi_char_to_cstr:
+    return emitOS400MICall(*this, "llvm.os400mi.char.to.cstr", RetVoidTy,
+                           Args);
+  case OS400MI::BI__builtin_os400mi_ol0:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.0", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol1:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.1", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol2:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.2", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol3:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.3", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol4:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.4", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol5:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.5", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol6:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.6", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol7:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.7", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ol8:
+    return emitOS400MICall(*this, "llvm.os400mi.ol.8", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_callx:
+    return emitOS400MICall(*this, "llvm.os400mi.callx", RetVoidTy, Args);
   case OS400MI::BI__builtin_os400mi_callx0:
     return emitOS400MICall(*this, "llvm.os400mi.callx.0", RetVoidTy, Args);
   case OS400MI::BI__builtin_os400mi_callx1:

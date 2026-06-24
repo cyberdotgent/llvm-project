@@ -21,6 +21,17 @@ void f(const char *s) {
   spcptr option = __builtin_os400mi_dm_put_wait_option();
   spcptr null_ptr = __builtin_os400mi_spcptr_null();
   __builtin_os400mi_callx3(put, ufcb, option, null_ptr);
+
+  spcptr ext = __builtin_os400mi_sysptr_program("LLVMWORK", "EXTUPPER");
+  spcptr in = __builtin_os400mi_native_char(16);
+  spcptr outp = __builtin_os400mi_native_char(16);
+  __builtin_os400mi_char_from_cstr_blank_padded(in, 16, "abc");
+  spcptr ol = __builtin_os400mi_ol2(in, outp);
+  __builtin_os400mi_callx(ext, ol);
+  __builtin_os400mi_char_to_cstr((char *)s, 16, outp);
+  spcptr bin = __builtin_os400mi_native_bin4();
+  __builtin_os400mi_native_bin4_set(bin, 7);
+  (void)__builtin_os400mi_native_bin4_get(bin);
 }
 
 // CHECK: call ptr @llvm.os400mi.ufcb()
@@ -40,3 +51,12 @@ void f(const char *s) {
 // CHECK: call ptr @llvm.os400mi.dm.put.wait.option()
 // CHECK: call ptr @llvm.os400mi.spcptr.null()
 // CHECK: call void @llvm.os400mi.callx.3(ptr {{.*}}, ptr {{.*}}, ptr {{.*}}, ptr {{.*}})
+// CHECK: call ptr @llvm.os400mi.sysptr.program(ptr {{.*}}, ptr {{.*}})
+// CHECK: call ptr @llvm.os400mi.native.char(i32 16)
+// CHECK: call ptr @llvm.os400mi.native.char(i32 16)
+// CHECK: call ptr @llvm.os400mi.ol.2(ptr {{.*}}, ptr {{.*}})
+// CHECK: call void @llvm.os400mi.callx(ptr {{.*}}, ptr {{.*}})
+// CHECK: call void @llvm.os400mi.char.to.cstr(ptr {{.*}}, i32 16, ptr {{.*}})
+// CHECK: call ptr @llvm.os400mi.native.bin4()
+// CHECK: call void @llvm.os400mi.native.bin4.set(ptr {{.*}}, i32 7)
+// CHECK: call i32 @llvm.os400mi.native.bin4.get(ptr {{.*}})

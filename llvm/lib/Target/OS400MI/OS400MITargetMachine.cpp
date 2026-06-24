@@ -1451,6 +1451,7 @@ class OS400MIEmitPass : public ModulePass {
     DenseMap<const Value *, I64Value> I64Values;
     DenseMap<const Value *, ArenaSlot> AggregateValues;
     DenseMap<const Value *, std::string> NativePtrValues;
+    DenseMap<const Value *, std::string> NativeOperandLists;
     DenseMap<const Value *, std::string> SignedNarrowValues;
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const Value *, I64CompareValue> I64Comparisons;
@@ -1466,6 +1467,7 @@ class OS400MIEmitPass : public ModulePass {
     bool HasLoadStoreLens = false;
     bool HasU1Box = false;
     bool HasNativeByteLens = false;
+    bool HasNativeBin4Lens = false;
     bool HasNativeSept = false;
     bool HasNativeNull = false;
     bool HasNativeUfcb = false;
@@ -1702,6 +1704,15 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          NCHAR     CHAR(1)    BAS(.NCHAR);");
     }
 
+    void ensureNativeBin4Lens() {
+      if (HasNativeBin4Lens)
+        return;
+
+      HasNativeBin4Lens = true;
+      Declarations.push_back("DCL     SPCPTR      .NBIN4;");
+      Declarations.push_back("DCL     DD          NBIN4     BIN(4)     BAS(.NBIN4);");
+    }
+
     void ensureNativeSept() {
       if (HasNativeSept)
         return;
@@ -1883,6 +1894,100 @@ class OS400MIEmitPass : public ModulePass {
       addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
                     Name.Collision, Name.Hash},
                    Kind.str(), "", std::nullopt, std::nullopt, 16, 16);
+      return NativeName;
+    }
+
+    std::string createNativeCharSlot(uint64_t Length, StringRef Kind) {
+      if (Length == 0 || Length > 32767)
+        fail("native CHAR slot length in range 1..32767");
+      GeneratedName Name = Names.createTempName();
+      std::string NativeName = "." + Name.Name;
+      Declarations.push_back("DCL     DD          " + Name.Name + " CHAR(" +
+                             std::to_string(Length) + ");");
+      Declarations.push_back("DCL     SPCPTR      " + NativeName + " INIT(" +
+                             Name.Name + ");");
+      addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
+                    Name.Collision, Name.Hash},
+                   Kind.str(), "", std::nullopt, std::nullopt,
+                   static_cast<uint32_t>(Length), 1);
+      return NativeName;
+    }
+
+    std::string createNativeBin4Slot(StringRef Kind) {
+      GeneratedName Name = Names.createTempName();
+      std::string NativeName = "." + Name.Name;
+      Declarations.push_back("DCL     DD          " + Name.Name +
+                             " BIN(4);");
+      Declarations.push_back("DCL     SPCPTR      " + NativeName + " INIT(" +
+                             Name.Name + ");");
+      addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
+                    Name.Collision, Name.Hash},
+                   Kind.str(), "", std::nullopt, std::nullopt, 4, 4);
+      return NativeName;
+    }
+
+    static bool isValidOS400ObjectName(StringRef Name, bool AllowSpecial) {
+      if (Name.empty() || Name.size() > 10)
+        return false;
+      auto IsUpper = [](char C) { return C >= 'A' && C <= 'Z'; };
+      auto IsDigit = [](char C) { return C >= '0' && C <= '9'; };
+      if (AllowSpecial && Name.starts_with("*"))
+        return llvm::all_of(Name.drop_front(), [&](char C) {
+          return IsUpper(C) || IsDigit(C);
+        });
+      return llvm::all_of(Name, [&](char C) {
+        return IsUpper(C) || IsDigit(C) || C == '_' || C == '$' ||
+               C == '#' || C == '@';
+      });
+    }
+
+    std::optional<std::string> getConstantCString(const Value *V) const {
+      const Value *Base = V->stripPointerCasts();
+      if (const auto *GEP = dyn_cast<GEPOperator>(Base)) {
+        APInt Offset(DL.getIndexSizeInBits(0), 0);
+        if (!GEP->accumulateConstantOffset(DL, Offset) ||
+            Offset.getZExtValue() != 0)
+          return std::nullopt;
+        Base = GEP->getPointerOperand()->stripPointerCasts();
+      }
+
+      const auto *GV = dyn_cast<GlobalVariable>(Base);
+      if (!GV || !GV->hasInitializer())
+        return std::nullopt;
+
+      const auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer());
+      if (!CDA || !CDA->isCString())
+        return std::nullopt;
+
+      StringRef Bytes = CDA->getAsString();
+      if (Bytes.empty() || Bytes.back() != '\0')
+        return std::nullopt;
+      return Bytes.drop_back().str();
+    }
+
+    std::string getProgramSysptr(const Value *LibraryValue,
+                                 const Value *ProgramValue) {
+      std::optional<std::string> Library = getConstantCString(LibraryValue);
+      std::optional<std::string> Program = getConstantCString(ProgramValue);
+      if (!Library || !Program)
+        fail("literal library and program names for sysptr_program");
+      if (!isValidOS400ObjectName(*Program, /*AllowSpecial=*/false))
+        fail("OS/400 program names of 1..10 uppercase name characters");
+      if (!isValidOS400ObjectName(*Library, /*AllowSpecial=*/true))
+        fail("OS/400 library names of 1..10 uppercase name characters");
+
+      GeneratedName Name = Names.createTempName(*Program);
+      std::string NativeName = "." + Name.Name;
+      std::string Decl =
+          "DCL SYSPTR " + NativeName + " INIT(\"" + *Program + "\"";
+      if (*Library != "*LIBL")
+        Decl += ", CTX(\"" + *Library + "\")";
+      Decl += ", TYPE(PGM));";
+      Declarations.push_back(std::move(Decl));
+      addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
+                    Name.Collision, Name.Hash},
+                   "native_program_sysptr", *Library + "/" + *Program,
+                   std::nullopt, std::nullopt, 16, 16);
       return NativeName;
     }
 
@@ -2951,6 +3056,13 @@ class OS400MIEmitPass : public ModulePass {
       return It->second;
     }
 
+    std::string getNativeOperandListName(const Value *V) const {
+      auto It = NativeOperandLists.find(V);
+      if (It == NativeOperandLists.end())
+        fail("native MI operand lists from OS400MI ol builtins");
+      return It->second;
+    }
+
     std::string addStaticOffset(const Twine &Kind, StringRef Base,
                                 uint64_t Offset) {
       if (Offset == 0)
@@ -3203,31 +3315,75 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back(Done + ":");
     }
 
-    void emitNativeCallx(const CallBase &CB, unsigned Arity) {
-      if (CB.arg_size() != Arity + 1)
-        fail("OS400MI callx arity matching its builtin name");
+    void emitNativeCharToCstr(const Value *DestPtr, const Value *Length,
+                              const Value *SourcePtr) {
+      ensureLoadStoreLens();
+      ensureNativeByteLens();
+      std::string Source = getNativePtrName(SourcePtr);
+      std::string Dest = createAnonymousTemp("native_cstr_dest");
+      std::string Count = createAnonymousTemp("native_cstr_count");
+      std::string Index = createAnonymousTemp("native_cstr_index");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "native_to_cstr_loop", "", std::nullopt);
+      addMapRecord(DoneName, "native_to_cstr_done", "", std::nullopt);
 
-      std::string Callee = getNativePtrName(CB.getArgOperand(0));
-      if (Arity == 0) {
-        Body.push_back("        CALLX       " + Callee + ",*,*;");
-        return;
-      }
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getPointerOffsetName(DestPtr) + ";");
+      Body.push_back("        CPYNV       " + Count + "," +
+                     getMemoryLengthName(Length) + ";");
+      Body.push_back("        CPYNV       " + Index + ",0;");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      Body.push_back("        ADDSPP      .NCHAR," + Source + "," + Index +
+                     ";");
+      Body.push_back("        CPYNV       OFF," + Dest + ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        CPYBLA      LS_I1,NCHAR;");
+      Body.push_back("        CMPBLA(B)   LS_I1,X'00'/EQ(" + Done + ");");
+      Body.push_back("        ADDN        " + Dest + "," + Dest + ",1;");
+      Body.push_back("        ADDN        " + Index + "," + Index + ",1;");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    std::string createNativeOperandList(ArrayRef<const Value *> Operands) {
+      if (Operands.empty())
+        return "*";
 
       GeneratedName OLName = Names.createTempName();
       std::string Decl = "DCL     OL          " + OLName.Name + "(";
-      for (unsigned I = 0; I != Arity; ++I) {
+      for (unsigned I = 0, E = Operands.size(); I != E; ++I) {
         if (I != 0)
           Decl += ",";
-        Decl += getNativePtrName(CB.getArgOperand(I + 1));
+        Decl += getNativePtrName(Operands[I]);
       }
       Decl += ")";
-      if (Arity == 1)
+      if (Operands.size() == 1)
         Decl += " ARG";
       Decl += ";";
       Declarations.push_back(std::move(Decl));
       addMapRecord(OLName, "native_callx_operand_list", "", std::nullopt);
-      Body.push_back("        CALLX       " + Callee + "," + OLName.Name +
-                     ",*;");
+      return OLName.Name;
+    }
+
+    void emitNativeCallx(const Value *CalleeValue, StringRef OperandList) {
+      std::string Callee = getNativePtrName(CalleeValue);
+      Body.push_back("        CALLX       " + Callee + "," +
+                     OperandList.str() + ",*;");
+    }
+
+    void emitNativeCallx(const CallBase &CB, unsigned Arity) {
+      if (CB.arg_size() != Arity + 1)
+        fail("OS400MI callx arity matching its builtin name");
+
+      SmallVector<const Value *, 8> Operands;
+      for (unsigned I = 0; I != Arity; ++I)
+        Operands.push_back(CB.getArgOperand(I + 1));
+      emitNativeCallx(CB.getArgOperand(0), createNativeOperandList(Operands));
     }
 
     bool lowerOS400MIPseudoCall(const CallBase &CB, const Function &Callee) {
@@ -3301,6 +3457,13 @@ class OS400MIEmitPass : public ModulePass {
             ".SEPT(" + getOperandName(CB.getArgOperand(0)) + ")";
         return true;
       }
+      if (Name == "llvm.os400mi.sysptr.program") {
+        if (CB.arg_size() != 2 || !CB.getType()->isPointerTy())
+          fail("OS400MI sysptr_program builtin signature");
+        NativePtrValues[&CB] =
+            getProgramSysptr(CB.getArgOperand(0), CB.getArgOperand(1));
+        return true;
+      }
       if (Name == "llvm.os400mi.spcptr.null") {
         if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
           fail("OS400MI spcptr_null builtin signature");
@@ -3317,6 +3480,42 @@ class OS400MIEmitPass : public ModulePass {
                        getNativePtrName(CB.getArgOperand(0)) + "," +
                        getOperandName(CB.getArgOperand(1)) + ";");
         NativePtrValues[&CB] = Dest;
+        return true;
+      }
+      if (Name == "llvm.os400mi.native.char") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI native_char builtin signature");
+        std::optional<uint64_t> Length = getConstantLength(CB.getArgOperand(0));
+        if (!Length)
+          fail("constant native CHAR slot lengths");
+        NativePtrValues[&CB] = createNativeCharSlot(*Length, "native_char");
+        return true;
+      }
+      if (Name == "llvm.os400mi.native.bin4") {
+        if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
+          fail("OS400MI native_bin4 builtin signature");
+        NativePtrValues[&CB] = createNativeBin4Slot("native_bin4");
+        return true;
+      }
+      if (Name == "llvm.os400mi.native.bin4.set") {
+        if (CB.arg_size() != 2 || !CB.getType()->isVoidTy())
+          fail("OS400MI native_bin4_set builtin signature");
+        ensureNativeBin4Lens();
+        std::string Slot = getNativePtrName(CB.getArgOperand(0));
+        Body.push_back("        CPYBWP      .NBIN4," + Slot + ";");
+        Body.push_back("        CPYNV       NBIN4," +
+                       getOperandName(CB.getArgOperand(1)) + ";");
+        return true;
+      }
+      if (Name == "llvm.os400mi.native.bin4.get") {
+        if (CB.arg_size() != 1 || !CB.getType()->isIntegerTy(32))
+          fail("OS400MI native_bin4_get builtin signature");
+        ensureNativeBin4Lens();
+        std::string Slot = getNativePtrName(CB.getArgOperand(0));
+        Body.push_back("        CPYBWP      .NBIN4," + Slot + ";");
+        std::string Dest = createTemp(CB);
+        Body.push_back("        CPYNV       " + Dest + ",NBIN4;");
+        Values[&CB] = Dest;
         return true;
       }
       if (Name == "llvm.os400mi.dm.put.wait.option") {
@@ -3349,6 +3548,34 @@ class OS400MIEmitPass : public ModulePass {
                                                 DefaultEBCDICCodePage)));
         emitNativeCharFromCstr(CB.getArgOperand(0), CB.getArgOperand(1),
                                CB.getArgOperand(2));
+        return true;
+      }
+      if (Name == "llvm.os400mi.char.to.cstr") {
+        if (CB.arg_size() != 3 || !CB.getType()->isVoidTy())
+          fail("OS400MI char_to_cstr builtin signature");
+        emitNativeCharToCstr(CB.getArgOperand(0), CB.getArgOperand(1),
+                             CB.getArgOperand(2));
+        return true;
+      }
+      if (Name.starts_with("llvm.os400mi.ol.")) {
+        unsigned Arity = 0;
+        StringRef Suffix = Name;
+        if (!Suffix.consume_front("llvm.os400mi.ol.") ||
+            Suffix.getAsInteger(10, Arity) || Arity > 8)
+          fail("known OS400MI operand-list builtin");
+        if (CB.arg_size() != Arity || !CB.getType()->isPointerTy())
+          fail("OS400MI operand-list builtin signature");
+        SmallVector<const Value *, 8> Operands;
+        for (unsigned I = 0; I != Arity; ++I)
+          Operands.push_back(CB.getArgOperand(I));
+        NativeOperandLists[&CB] = createNativeOperandList(Operands);
+        return true;
+      }
+      if (Name == "llvm.os400mi.callx") {
+        if (CB.arg_size() != 2 || !CB.getType()->isVoidTy())
+          fail("OS400MI callx builtin signature");
+        emitNativeCallx(CB.getArgOperand(0),
+                        getNativeOperandListName(CB.getArgOperand(1)));
         return true;
       }
       if (Name == "llvm.os400mi.callx.0") {
@@ -3985,8 +4212,12 @@ class OS400MIEmitPass : public ModulePass {
       if (Callee && lowerOS400MIPseudoCall(CB, *Callee))
         return;
 
-      if (isa<IntrinsicInst>(CB))
+      if (const auto *II = dyn_cast<IntrinsicInst>(&CB)) {
+        if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+            II->getIntrinsicID() == Intrinsic::lifetime_end)
+          return;
         fail("supported LLVM intrinsics");
+      }
 
       if (!Callee || Callee->isDeclaration())
         fail("defined internal callees; external calls require CALLX ABI");
@@ -4124,6 +4355,7 @@ class OS400MIEmitPass : public ModulePass {
       I64Values.clear();
       AggregateValues.clear();
       NativePtrValues.clear();
+      NativeOperandLists.clear();
       SignedNarrowValues.clear();
       Comparisons.clear();
       I64Comparisons.clear();

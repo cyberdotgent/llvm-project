@@ -3462,14 +3462,32 @@ class OS400MIEmitPass : public ModulePass {
         ensureNativeSept();
         std::string Original = getOriginalName(CB);
         GeneratedName PtrName = Names.createTempName(Original);
+        GeneratedName EntryName =
+            Names.createTempName(Original + ".sept.entry");
         GeneratedName OffsetName = Names.createTempName(Original + ".sept.off");
         std::string Ptr = "." + PtrName.Name;
-        std::string Entry = "." + PtrName.Name + "E";
+        std::string Entry = "." + EntryName.Name;
+        std::string MapOriginal =
+            Original.empty() ? "llvm.os400mi.sysptr.sept" : Original;
+        std::optional<SourceLocationRecord> SourceLocation =
+            getSourceLocation(CB);
         Declarations.push_back("DCL     SPCPTR      " + Ptr + ";");
         Declarations.push_back("DCL     SYSPTR      " + Entry + " BAS(" + Ptr +
                                ");");
         Declarations.push_back("DCL     DD          " + OffsetName.Name +
                                " BIN(4);");
+        addMapRecord({Ptr, PtrName.Class, PtrName.Ordinal,
+                      PtrName.CollisionOrdinal, PtrName.Collision,
+                      PtrName.Hash},
+                     "native_sept_entry_spcptr", MapOriginal, SourceLocation,
+                     std::nullopt, 16, 16);
+        addMapRecord({Entry, EntryName.Class, EntryName.Ordinal,
+                      EntryName.CollisionOrdinal, EntryName.Collision,
+                      EntryName.Hash},
+                     "native_sept_entry_sysptr", MapOriginal, SourceLocation,
+                     std::nullopt, 16, 16);
+        addMapRecord(OffsetName, "native_sept_entry_offset", MapOriginal,
+                     SourceLocation, std::nullopt, 4, 4);
         Body.push_back("        CPYNV       " + OffsetName.Name + "," +
                        getOperandName(CB.getArgOperand(0)) + ";");
         Body.push_back("        SUBN        " + OffsetName.Name + "," +

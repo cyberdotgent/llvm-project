@@ -1,4 +1,7 @@
 ; RUN: llc -mtriple=os400mi < %s | FileCheck %s --implicit-check-not='.SEPT('
+; RUN: rm -f %t.mi %t.mi.jsonl
+; RUN: llc -mtriple=os400mi-ibm-os400 -filetype=asm -o %t.mi %s
+; RUN: FileCheck --check-prefix=MAP --input-file=%t.mi.jsonl %s
 
 @hello = internal constant [14 x i8] c"Hello, world!\00"
 @file = internal constant [8 x i8] c"QSYSPRT\00"
@@ -52,7 +55,7 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 
 ; CHECK-DAG: DCL     SPCPTR      @SEPT     BASPCO;
 ; CHECK-DAG: DCL     SPCPTR      .{{[A-Z0-9]+}};
-; CHECK-DAG: DCL     SYSPTR      .{{[A-Z0-9]+}}E BAS(.{{[A-Z0-9]+}});
+; CHECK-DAG: DCL     SYSPTR      .{{[A-Z0-9]+}} BAS(.{{[A-Z0-9]+}});
 ; CHECK-DAG: DCL     SPCPTR      .OFCB     INIT(OFCB);
 ; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCOPEN", CTX("QSYS"), TYPE(PGM));
 ; CHECK-DAG: DCL SYSPTR .{{[A-Z0-9]+}} INIT("QDMCLOSE", CTX("QSYS"), TYPE(PGM));
@@ -72,5 +75,9 @@ declare void @llvm.os400mi.callx.3(ptr, ptr, ptr, ptr)
 ; CHECK: SUBN        {{[A-Z0-9]+}},{{[A-Z0-9]+}},1;
 ; CHECK: MULT        {{[A-Z0-9]+}},{{[A-Z0-9]+}},16;
 ; CHECK: ADDSPP      .{{[A-Z0-9]+}},@SEPT,{{[A-Z0-9]+}};
-; CHECK: CALLX       .{{[A-Z0-9]+}}E,{{[^,]+}},*;
 ; CHECK: CALLX       .{{[A-Z0-9]+}},{{[^,]+}},*;
+; CHECK: CALLX       .{{[A-Z0-9]+}},{{[^,]+}},*;
+
+; MAP-DAG: {"mi_name":".{{[A-Z0-9]+}}","kind":"native_sept_entry_spcptr","name_class":"temp","name_ordinal":{{[0-9]+}},"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"put","size":16,"alignment":16}
+; MAP-DAG: {"mi_name":".{{[A-Z0-9]+}}","kind":"native_sept_entry_sysptr","name_class":"temp","name_ordinal":{{[0-9]+}},"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"put","size":16,"alignment":16}
+; MAP-DAG: {"mi_name":"{{[A-Z0-9]+}}","kind":"native_sept_entry_offset","name_class":"temp","name_ordinal":{{[0-9]+}},"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"put","size":4,"alignment":4}

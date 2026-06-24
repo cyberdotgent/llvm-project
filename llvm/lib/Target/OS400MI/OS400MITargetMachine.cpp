@@ -1257,6 +1257,10 @@ class OS400MIEmitPass : public ModulePass {
     std::string ReturnPointerName;
     Slot ReturnSlot;
     SmallVector<Slot, 4> Args;
+    std::string VarArgAreaName;
+    uint32_t VarArgAreaOffset = 0;
+    uint32_t VarArgAreaSize = 0;
+    uint32_t MaxVarArgBytes = 0;
   };
 
   struct CtorDtorEntry {
@@ -1273,6 +1277,10 @@ class OS400MIEmitPass : public ModulePass {
     SmallVector<CtorDtorEntry, 4> Destructors;
     SmallVector<std::string, 8> Declarations;
     SmallVector<MapRecord, 8> MapRecords;
+
+    static uint32_t alignTo(uint32_t Value, uint32_t Alignment) {
+      return (Value + Alignment - 1) & ~(Alignment - 1);
+    }
 
     static std::string getOriginalName(const Function &F) {
       if (F.hasName())
@@ -1292,13 +1300,25 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     static bool isSupportedCallType(const FunctionType *Ty) {
-      if (Ty->isVarArg() || !isSupportedReturnABIType(Ty->getReturnType()))
+      if (!isSupportedReturnABIType(Ty->getReturnType()))
         return false;
       for (Type *ParamTy : Ty->params()) {
         if (!isSupportedParamABIType(ParamTy))
           return false;
       }
       return true;
+    }
+
+    static bool isSupportedVarArgABIType(Type *Ty) {
+      return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+             Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+             Ty->isIntegerTy(64) || Ty->isPointerTy();
+    }
+
+    static uint32_t getVarArgSlotSize(Type *Ty) {
+      if (!isSupportedVarArgABIType(Ty))
+        fail("varargs with i1/i8/i16/i32/i64/PTR32 values");
+      return Ty->isIntegerTy(64) ? 8 : 4;
     }
 
     static bool isI64Slot(Type *Ty) { return Ty->isIntegerTy(64); }
@@ -1433,6 +1453,25 @@ class OS400MIEmitPass : public ModulePass {
       createHelperInfo(F);
     }
 
+    void noteVarArgCall(const CallBase &CB, const Function &Callee) {
+      FunctionType *Ty = Callee.getFunctionType();
+      if (!Ty->isVarArg())
+        return;
+      if (CB.arg_size() < Ty->getNumParams())
+        fail("vararg direct calls with all fixed arguments present");
+
+      uint32_t Offset = 0;
+      for (unsigned I = Ty->getNumParams(), E = CB.arg_size(); I != E; ++I) {
+        Type *ArgTy = CB.getArgOperand(I)->getType();
+        uint32_t Size = getVarArgSlotSize(ArgTy);
+        Offset = alignTo(Offset, 4);
+        Offset += Size;
+      }
+
+      FunctionInfo &Info = Infos[&Callee];
+      Info.MaxVarArgBytes = std::max(Info.MaxVarArgBytes, Offset);
+    }
+
     void validateFunctionSignature(const Function &F, bool IsEntry) const {
       FunctionType *Ty = F.getFunctionType();
       if (IsEntry) {
@@ -1493,6 +1532,8 @@ class OS400MIEmitPass : public ModulePass {
                  "definition or explicit OS400MI CALLX builtins");
 
           validateFunctionSignature(*Callee, false);
+          ensureInfo(*Callee);
+          noteVarArgCall(*CB, *Callee);
           visitFunction(*Callee, false);
         }
       }
@@ -1570,6 +1611,44 @@ class OS400MIEmitPass : public ModulePass {
       for (const CtorDtorEntry &Entry : Destructors)
         visitFunction(*Entry.F, false);
 
+      uint32_t NextStackOffset = FirstArenaOffset;
+      for (const Function *F : Functions) {
+        FunctionInfo &Info = Infos[F];
+        if (Info.MaxVarArgBytes == 0)
+          continue;
+        uint32_t Offset = alignTo(NextStackOffset, 4);
+        if (Offset + Info.MaxVarArgBytes > StackSize)
+          fail("phase-1 vararg save areas within 256-byte C stack");
+        GeneratedName AreaName =
+            Names.createSlotName(Info.EntryName + "_varargs");
+        Info.VarArgAreaName = AreaName.Name;
+        Info.VarArgAreaOffset = Offset;
+        Info.VarArgAreaSize = Info.MaxVarArgBytes;
+        Declarations.push_back("DCL     DD          " + Info.VarArgAreaName +
+                               "    CHAR(" +
+                               std::to_string(Info.VarArgAreaSize) +
+                               ")    DEF(C_STACK) POS(" +
+                               std::to_string(Offset + 1) + ");");
+        MapRecords.push_back({AreaName.Name,
+                              "vararg_save_area",
+                              AreaName.Class,
+                              getOriginalName(*F),
+                              AreaName.Ordinal,
+                              AreaName.Collision
+                                  ? std::optional<uint32_t>(
+                                        AreaName.CollisionOrdinal)
+                                  : std::nullopt,
+                              AreaName.Collision,
+                              NameAllocator::getMaxMINameLength(),
+                              AreaName.Hash,
+                              getSourceLocation(*F),
+                              Offset,
+                              Info.VarArgAreaSize,
+                              4,
+                              "stack-region;caller-filled;slot-align=4"});
+        NextStackOffset = Offset + Info.VarArgAreaSize;
+      }
+
       // Whole-program hosted links can leave unused definitions from selected
       // bitcode archive members.  Lower only the program slice reachable from
       // the OS400MI entry function; unresolved or unsupported calls in that
@@ -1585,6 +1664,16 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<const Function *> getFunctions() const { return Functions; }
     ArrayRef<CtorDtorEntry> getConstructors() const { return Constructors; }
     ArrayRef<CtorDtorEntry> getDestructors() const { return Destructors; }
+
+    uint32_t getInitialStackOffset() const {
+      uint32_t Offset = FirstArenaOffset;
+      for (const Function *F : Functions) {
+        const FunctionInfo &Info = getInfo(*F);
+        if (Info.VarArgAreaSize)
+          Offset = std::max(Offset, Info.VarArgAreaOffset + Info.VarArgAreaSize);
+      }
+      return Offset;
+    }
 
     const FunctionInfo &getInfo(const Function &F) const {
       auto It = Infos.find(&F);
@@ -1648,6 +1737,18 @@ class OS400MIEmitPass : public ModulePass {
 
     static bool isAggregateABIType(Type *Ty) {
       return isAggregateABIValueType(Ty);
+    }
+
+    static bool isSupportedVarArgABIType(Type *Ty) {
+      return Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+             Ty->isIntegerTy(16) || Ty->isIntegerTy(32) ||
+             Ty->isIntegerTy(64) || Ty->isPointerTy();
+    }
+
+    static uint32_t getVarArgSlotSize(Type *Ty) {
+      if (!isSupportedVarArgABIType(Ty))
+        fail("varargs with i1/i8/i16/i32/i64/PTR32 values");
+      return Ty->isIntegerTy(64) ? 8 : 4;
     }
 
     static uint32_t alignTo4(uint32_t Value) { return (Value + 3) & ~3U; }
@@ -4592,6 +4693,16 @@ class OS400MIEmitPass : public ModulePass {
         if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
             II->getIntrinsicID() == Intrinsic::lifetime_end)
           return;
+        if (II->getIntrinsicID() == Intrinsic::vastart) {
+          lowerVAStart(CB);
+          return;
+        }
+        if (II->getIntrinsicID() == Intrinsic::vaend)
+          return;
+        if (II->getIntrinsicID() == Intrinsic::vacopy) {
+          lowerVACopy(CB);
+          return;
+        }
         fail("supported LLVM intrinsics");
       }
 
@@ -4610,10 +4721,15 @@ class OS400MIEmitPass : public ModulePass {
             isAggregateABIType(CB.getType())))
         fail("direct void/i1/i8/i16/i32/i64/PTR32/aggregate function call "
              "results");
-      if (CB.arg_size() != CalleeInfo.Args.size())
+      FunctionType *CalleeTy = Callee->getFunctionType();
+      if (CalleeTy->isVarArg()) {
+        if (CB.arg_size() < CalleeInfo.Args.size())
+          fail("direct vararg function calls with all fixed arguments");
+      } else if (CB.arg_size() != CalleeInfo.Args.size()) {
         fail("direct function call arguments matching callee signature");
+      }
 
-      for (unsigned I = 0, E = CB.arg_size(); I != E; ++I) {
+      for (unsigned I = 0, E = CalleeInfo.Args.size(); I != E; ++I) {
         const Value *Arg = CB.getArgOperand(I);
         const FunctionInfo::Slot &ArgSlot = CalleeInfo.Args[I];
         if (ArgSlot.Ty != Arg->getType())
@@ -4633,6 +4749,20 @@ class OS400MIEmitPass : public ModulePass {
         Body.push_back("        CPYNV       " + ArgSlot.Name + "," +
                        getOperandName(Arg) + ";");
         maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
+      }
+
+      if (CalleeTy->isVarArg()) {
+        uint32_t VarArgOffset = 0;
+        for (unsigned I = CalleeInfo.Args.size(), E = CB.arg_size(); I != E;
+             ++I) {
+          const Value *Arg = CB.getArgOperand(I);
+          uint32_t SlotSize = getVarArgSlotSize(Arg->getType());
+          VarArgOffset = alignTo(VarArgOffset, 4);
+          if (VarArgOffset + SlotSize > CalleeInfo.VarArgAreaSize)
+            fail("planned vararg save area large enough for direct call");
+          emitStoreVarArgValue(CalleeInfo.VarArgAreaOffset + VarArgOffset, Arg);
+          VarArgOffset += SlotSize;
+        }
       }
 
       invalidateCallAliasedMemory(CB, CalleeInfo);
@@ -4672,6 +4802,76 @@ class OS400MIEmitPass : public ModulePass {
         fail("runtime ctor/dtor calls returning void");
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
+    }
+
+    void emitStoreVarArgValue(uint32_t Offset, const Value *Arg) {
+      Type *Ty = Arg->getType();
+      std::string PtrValue = std::to_string(StackRegionTag + Offset);
+      if (Ty->isIntegerTy(64)) {
+        emitStoreI64ToPointerValue(PtrValue, getI64Operand(Arg));
+        return;
+      }
+
+      if (!isSupportedVarArgABIType(Ty))
+        fail("varargs with i1/i8/i16/i32/i64/PTR32 values");
+      emitSetLensPointerFromPointerValue(PtrValue);
+      Body.push_back("        CPYNV       LS_I4," + getOperandName(Arg) + ";");
+    }
+
+    void lowerVAStart(const CallBase &CB) {
+      if (!CurrentFunction->F || !CurrentFunction->F->isVarArg())
+        fail("llvm.va_start only in vararg functions");
+      if (CB.arg_size() != 1 || !CB.getArgOperand(0)->getType()->isPointerTy())
+        fail("llvm.va_start with va_list pointer operand");
+
+      uint32_t Offset = CurrentFunction->VarArgAreaSize
+                            ? CurrentFunction->VarArgAreaOffset
+                            : FirstArenaOffset;
+      emitSetLensPointer(CB.getArgOperand(0));
+      Body.push_back("        CPYNV       LS_I4," +
+                     std::to_string(StackRegionTag + Offset) + ";");
+    }
+
+    void lowerVACopy(const CallBase &CB) {
+      if (CB.arg_size() != 2 || !CB.getArgOperand(0)->getType()->isPointerTy() ||
+          !CB.getArgOperand(1)->getType()->isPointerTy())
+        fail("llvm.va_copy with destination and source va_list pointers");
+
+      std::string Current = createAnonymousTemp("va_copy_ptr");
+      emitSetLensPointer(CB.getArgOperand(1));
+      emitLoadFromReference(Current, "LS_I4", AccessWidth::I32);
+      emitSetLensPointer(CB.getArgOperand(0));
+      Body.push_back("        CPYNV       LS_I4," + Current + ";");
+    }
+
+    void lowerVAArg(const VAArgInst &VAI) {
+      Type *Ty = VAI.getType();
+      if (!isSupportedVarArgABIType(Ty))
+        fail("va_arg with i1/i8/i16/i32/i64/PTR32 result types");
+
+      std::string Current = createAnonymousTemp("va_arg_ptr");
+      emitSetLensPointer(VAI.getPointerOperand());
+      emitLoadFromReference(Current, "LS_I4", AccessWidth::I32);
+
+      uint32_t SlotSize = getVarArgSlotSize(Ty);
+      if (Ty->isIntegerTy(64)) {
+        I64Value Dest = createI64Temp(VAI);
+        emitLoadI64FromPointerValue(Dest, Current);
+        I64Values[&VAI] = Dest;
+      } else {
+        std::string Dest = createTemp(VAI);
+        emitSetLensPointerFromPointerValue(Current);
+        emitLoadFromReference(Dest, getLensName(getAccessWidth(Ty)),
+                              getAccessWidth(Ty));
+        maskIntegerSlotToType(Dest, Ty);
+        Values[&VAI] = Dest;
+      }
+
+      std::string Next = createAnonymousTemp("va_arg_next");
+      Body.push_back("        ADDN        " + Next + "," + Current + "," +
+                     std::to_string(SlotSize) + ";");
+      emitSetLensPointer(VAI.getPointerOperand());
+      Body.push_back("        CPYNV       LS_I4," + Next + ";");
     }
 
     void lowerReturn(const ReturnInst &RI) {
@@ -4750,7 +4950,8 @@ class OS400MIEmitPass : public ModulePass {
                     const ModuleFunctionPlan &FunctionPlan,
                     NameAllocator &Names)
         : Names(Names), DL(DL), Layout(Layout), FunctionPlan(FunctionPlan),
-          NextArenaOffset(Layout.getNextArenaOffset()) {}
+          NextArenaOffset(Layout.getNextArenaOffset()),
+          NextStackOffset(FunctionPlan.getInitialStackOffset()) {}
 
     void lower(const Function &F) {
       CurrentFunction = &FunctionPlan.getInfo(F);
@@ -4855,6 +5056,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerMemCpy(*MI);
           } else if (const auto *MI = dyn_cast<MemSetInst>(&I)) {
             lowerMemSet(*MI);
+          } else if (const auto *VAI = dyn_cast<VAArgInst>(&I)) {
+            lowerVAArg(*VAI);
           } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
             lowerCall(*CB);
           } else if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
@@ -4869,8 +5072,8 @@ class OS400MIEmitPass : public ModulePass {
           } else {
             fail("supported scalar alloca/getelementptr/store/load/add/sub/"
                  "and/or/icmp/zext/sext/trunc/ptrtoint/select/phi, "
-                 "extractvalue, insertvalue, memcpy, memset, branch, and ret "
-                 "instructions");
+                 "extractvalue, insertvalue, memcpy, memset, va_arg, branch, "
+                 "and ret instructions");
           }
         }
 

@@ -17,8 +17,8 @@ entry:
 
 ; MI: DCL     DD          C_MEM      CHAR(256) BDRY(16);
 ; MI: DCL     DD          G000001    BIN(4)     DEF(C_MEM) POS(5) INIT(7);
-; MI: DCL     DD          L000001    CHAR(3)    DEF(C_MEM) POS(9)
-; MI-NEXT: INIT(X'C88900');
+; MI: DCL     DD          L000001    CHAR(3)    DEF(C_MEM) POS(9);
+; MI-NEXT: DCL DD H000001 CHAR(3) DEF(L000001) POS(1) INIT(X'C88900');
 ; MI: CPYNV       T000001,G000001;
 
 ; MAP: {"mi_name":"C_MEM","kind":"arena","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}
@@ -26,5 +26,6 @@ entry:
 ; MAP-NEXT: {"mi_name":"MAIN","kind":"function","name_class":"function","max_name_length":48,"collision":false,"original":"main"}
 ; MAP-NEXT: {"mi_name":"G000001","kind":"global","name_class":"global","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"g","arena_offset":4,"size":4,"alignment":4}
 ; MAP-NEXT: {"mi_name":"L000001","kind":"string","name_class":"literal","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":".str","arena_offset":8,"size":3,"alignment":1,"encoding":"ibm-037"}
+; MAP-NEXT: {"mi_name":"H000001","kind":"initializer_chunk","name_class":"helper","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"L000001","arena_offset":8,"size":3,"alignment":1,"encoding":"ibm-037"}
 ; MAP-NEXT: {"mi_name":"B000001","kind":"basic_block","name_class":"label","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"entry"}
 ; MAP-NEXT: {"mi_name":"T000001","kind":"temp","name_class":"temp","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"v","size":4,"alignment":4}

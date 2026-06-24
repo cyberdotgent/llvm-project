@@ -103,6 +103,7 @@ class OS400MIEmitPass : public ModulePass {
 
   static constexpr uint32_t ArenaSize = 256;
   static constexpr uint32_t FirstArenaOffset = 4;
+  static constexpr size_t MaxMISourceLineLength = 80;
 
   static void fail(const Twine &Message) {
     report_fatal_error("OS400MI MVP only supports " + Message, false);
@@ -156,6 +157,17 @@ class OS400MIEmitPass : public ModulePass {
         continue;
       }
       Output.push_back(Line.str());
+    }
+  }
+
+  static void validateMISourceLines(ArrayRef<std::string> Lines) {
+    for (const auto &[Index, Line] : enumerate(Lines)) {
+      if (Line.size() <= MaxMISourceLineLength)
+        continue;
+
+      fail("MI source lines no longer than 80 characters; generated line " +
+           Twine(Index + 1) + " has " + Twine(Line.size()) + " characters: " +
+           Line);
     }
   }
 
@@ -885,6 +897,36 @@ class OS400MIEmitPass : public ModulePass {
       OS400MIEmitPass::writeConstantBytes(DL, C, Bytes);
     }
 
+    void appendChunkedHexInitializers(
+        const GeneratedName &BaseName, StringRef Hex, uint32_t ArenaOffset,
+        uint32_t Size, std::optional<SourceLocationRecord> SourceLocation,
+        StringRef Encoding) {
+      uint32_t ByteOffset = 0;
+      while (ByteOffset != Size) {
+        uint32_t ChunkSize = Size - ByteOffset;
+        GeneratedName ChunkName = Names.createHelperName(BaseName.Name);
+        while (ChunkSize != 0) {
+          std::string Line =
+              "DCL DD " + ChunkName.Name + " CHAR(" +
+              std::to_string(ChunkSize) + ") DEF(" + BaseName.Name +
+              ") POS(" + std::to_string(ByteOffset + 1) + ") INIT(X'" +
+              Hex.substr(ByteOffset * 2, ChunkSize * 2).str() + "');";
+          if (Line.size() <= MaxMISourceLineLength) {
+            Declarations.push_back(std::move(Line));
+            addMapRecord(ChunkName, "initializer_chunk", BaseName.Name,
+                         ArenaOffset + ByteOffset, ChunkSize, 1,
+                         SourceLocation, Encoding.str());
+            break;
+          }
+          --ChunkSize;
+        }
+
+        if (ChunkSize == 0)
+          fail("MI source line width for chunked hex initializers");
+        ByteOffset += ChunkSize;
+      }
+    }
+
     void layoutIntegerGlobal(const GlobalVariable &GV) {
       const auto *CI = dyn_cast<ConstantInt>(GV.getInitializer());
       if (!CI || !(CI->getType()->isIntegerTy(8) ||
@@ -981,12 +1023,13 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
                              std::to_string(Size) +
                              ")    DEF(C_MEM) POS(" +
-                             std::to_string(Offset + 1) + ")");
-      Declarations.push_back("                          INIT(X'" + Hex + "');");
+                             std::to_string(Offset + 1) + ");");
       addGlobalObject(GV, Name, "string", Offset, Size, 1, AccessWidth::I8,
                       false);
+      std::optional<SourceLocationRecord> Loc = getSourceLocation(GV);
       addMapRecord(Name, "string", std::move(Original), Offset, Size, 1,
-                   getSourceLocation(GV), "ibm-037");
+                   Loc, "ibm-037");
+      appendChunkedHexInitializers(Name, Hex, Offset, Size, Loc, "ibm-037");
       NextArenaOffset = Offset + Size;
     }
 
@@ -1008,12 +1051,14 @@ class OS400MIEmitPass : public ModulePass {
       GeneratedName Name = Names.createGlobalName(Original);
       Declarations.push_back("DCL DD " + Name.Name + " CHAR(" +
                              std::to_string(Size) + ") DEF(C_MEM) POS(" +
-                             std::to_string(Offset + 1) + ") INIT(X'" +
-                             getRawHex(Bytes) + "');");
+                             std::to_string(Offset + 1) + ");");
       addGlobalObject(GV, Name, "aggregate", Offset, Size, Alignment,
                       AccessWidth::I8, false);
+      std::optional<SourceLocationRecord> Loc = getSourceLocation(GV);
       addMapRecord(Name, "aggregate", std::move(Original), Offset, Size,
-                   Alignment, getSourceLocation(GV), "raw-bytes");
+                   Alignment, Loc, "raw-bytes");
+      appendChunkedHexInitializers(Name, getRawHex(Bytes), Offset, Size, Loc,
+                                   "raw-bytes");
       NextArenaOffset = Offset + Size;
     }
 
@@ -4130,35 +4175,40 @@ class OS400MIEmitPass : public ModulePass {
                    const FunctionLowerer &Lowerer) {
     SmallVector<std::string, 16> ModuleAsmLines;
     appendRawAsmLines(ModuleAsmLines, M.getModuleInlineAsm());
-    for (const std::string &Line : ModuleAsmLines)
-      OS << Line << "\n";
-    OS << "DCL     SPCPTR      ARGC@      PARM;\n";
-    OS << "DCL     SPCPTR      ARGV@      PARM;\n";
-    OS << "DCL     OL          PARM_LIST\n";
-    OS << "                   (ARGC@,\n";
-    OS << "                    ARGV@)\n";
-    OS << "                    PARM       EXT        MIN(0);\n";
-    OS << "DCL     DD          ARGC       BIN(4)     BAS(ARGC@);\n";
-    OS << "DCL     SPCPTR      ARGV       BAS(ARGV@);\n";
-    OS << "DCL     DD          NBR_PARMS  BIN(2);\n";
-    OS << "DCL     DD          MAIN_RC    BIN(4);\n";
-    OS << "DCL     DD          C_MEM      CHAR(" << Layout.getArenaSize()
-       << ") BDRY(16);\n";
-    OS << "DCL     SPCPTR      .C_BASE    INIT(C_MEM);\n";
+
+    SmallVector<std::string, 256> Lines;
+    Lines.append(ModuleAsmLines.begin(), ModuleAsmLines.end());
+    Lines.push_back("DCL     SPCPTR      ARGC@      PARM;");
+    Lines.push_back("DCL     SPCPTR      ARGV@      PARM;");
+    Lines.push_back("DCL     OL          PARM_LIST");
+    Lines.push_back("                   (ARGC@,");
+    Lines.push_back("                    ARGV@)");
+    Lines.push_back("                    PARM       EXT        MIN(0);");
+    Lines.push_back("DCL     DD          ARGC       BIN(4)     BAS(ARGC@);");
+    Lines.push_back("DCL     SPCPTR      ARGV       BAS(ARGV@);");
+    Lines.push_back("DCL     DD          NBR_PARMS  BIN(2);");
+    Lines.push_back("DCL     DD          MAIN_RC    BIN(4);");
+    Lines.push_back("DCL     DD          C_MEM      CHAR(" +
+                    std::to_string(Layout.getArenaSize()) + ") BDRY(16);");
+    Lines.push_back("DCL     SPCPTR      .C_BASE    INIT(C_MEM);");
     for (const std::string &Decl : Layout.getDeclarations())
-      OS << Decl << "\n";
+      Lines.push_back(Decl);
     for (const std::string &Decl : Plan.getDeclarations())
-      OS << Decl << "\n";
+      Lines.push_back(Decl);
     for (const std::string &Decl : Lowerer.getDeclarations())
-      OS << Decl << "\n";
-    OS << "DCL     INSPTR      .MAIN;\n";
-    OS << "ENTRY * (PARM_LIST) EXT;\n";
-    OS << "        STPLLEN     NBR_PARMS;\n";
-    OS << "        CALLI       MAIN, *, .MAIN;\n";
-    OS << "        RTX         *;\n";
+      Lines.push_back(Decl);
+    Lines.push_back("DCL     INSPTR      .MAIN;");
+    Lines.push_back("ENTRY * (PARM_LIST) EXT;");
+    Lines.push_back("        STPLLEN     NBR_PARMS;");
+    Lines.push_back("        CALLI       MAIN, *, .MAIN;");
+    Lines.push_back("        RTX         *;");
     for (const std::string &Line : Lowerer.getBody())
+      Lines.push_back(Line);
+    Lines.push_back("        PEND;");
+
+    validateMISourceLines(Lines);
+    for (const std::string &Line : Lines)
       OS << Line << "\n";
-    OS << "        PEND;\n";
   }
 
   static MapRecord makeFixedMapRecord(

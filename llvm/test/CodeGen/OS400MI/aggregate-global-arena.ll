@@ -21,12 +21,18 @@ entry:
   ret i32 %sum
 }
 
-; CHECK: DCL DD G000001 CHAR(4) DEF(C_MEM) POS(5) INIT(X'0102FF00');
-; CHECK: DCL DD G000002 CHAR(8) DEF(C_MEM) POS(9) INIT(X'01001234FFFFFFFF');
-; CHECK: DCL DD G000003 CHAR(4) DEF(C_MEM) POS(17) INIT(X'00000000');
+; CHECK: DCL DD G000001 CHAR(4) DEF(C_MEM) POS(5);
+; CHECK-NEXT: DCL DD H000001 CHAR(4) DEF(G000001) POS(1) INIT(X'0102FF00');
+; CHECK-NEXT: DCL DD G000002 CHAR(8) DEF(C_MEM) POS(9);
+; CHECK-NEXT: DCL DD H000002 CHAR(8) DEF(G000002) POS(1) INIT(X'01001234FFFFFFFF');
+; CHECK-NEXT: DCL DD G000003 CHAR(4) DEF(C_MEM) POS(17);
+; CHECK-NEXT: DCL DD H000003 CHAR(4) DEF(G000003) POS(1) INIT(X'00000000');
 ; CHECK: ADDSPP      .LS,.C_BASE,OFF;
 ; CHECK: CPYNV       MAIN_RC,{{T[0-9]+}};
 
 ; MAP: {"mi_name":"G000001","kind":"aggregate","name_class":"global","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"bytes","arena_offset":4,"size":4,"alignment":1,"encoding":"raw-bytes"}
+; MAP: {"mi_name":"H000001","kind":"initializer_chunk","name_class":"helper","name_ordinal":1,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"G000001","arena_offset":4,"size":4,"alignment":1,"encoding":"raw-bytes"}
 ; MAP: {"mi_name":"G000002","kind":"aggregate","name_class":"global","name_ordinal":2,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"pair","arena_offset":8,"size":8,"alignment":4,"encoding":"raw-bytes"}
+; MAP: {"mi_name":"H000002","kind":"initializer_chunk","name_class":"helper","name_ordinal":2,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"G000002","arena_offset":8,"size":8,"alignment":1,"encoding":"raw-bytes"}
 ; MAP: {"mi_name":"G000003","kind":"aggregate","name_class":"global","name_ordinal":3,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"zeros","arena_offset":16,"size":4,"alignment":2,"encoding":"raw-bytes"}
+; MAP: {"mi_name":"H000003","kind":"initializer_chunk","name_class":"helper","name_ordinal":3,"max_name_length":48,"collision":false,"hash":"{{[0-9A-F]+}}","original":"G000003","arena_offset":16,"size":4,"alignment":1,"encoding":"raw-bytes"}

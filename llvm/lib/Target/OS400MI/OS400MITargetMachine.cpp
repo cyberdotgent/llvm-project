@@ -103,7 +103,7 @@ class OS400MIEmitPass : public ModulePass {
   std::string OutputFilename;
 
   static constexpr uint32_t ArenaSize = 256;
-  static constexpr uint32_t StackSize = 256;
+  static constexpr uint32_t MinStackSize = 32767;
   static constexpr uint32_t FirstArenaOffset = 4;
   static constexpr uint32_t StaticRegionTag = 0x10000000;
   static constexpr uint32_t StackRegionTag = 0x20000000;
@@ -544,6 +544,9 @@ class OS400MIEmitPass : public ModulePass {
     if (const auto *AT = dyn_cast<ArrayType>(Ty))
       return isSupportedArenaAggregateType(AT->getElementType());
 
+    if (const auto *VT = dyn_cast<FixedVectorType>(Ty))
+      return isSupportedArenaAggregateType(VT->getElementType());
+
     if (const auto *ST = dyn_cast<StructType>(Ty)) {
       for (Type *EltTy : ST->elements()) {
         if (!isSupportedArenaAggregateType(EltTy))
@@ -875,6 +878,15 @@ class OS400MIEmitPass : public ModulePass {
       if (isa<ConstantPointerNull>(C))
         return 0;
 
+      if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
+        if (CE->getOpcode() == Instruction::IntToPtr) {
+          const auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0));
+          if (!CI)
+            return std::nullopt;
+          return CI->getValue().trunc(32).getZExtValue();
+        }
+      }
+
       const Value *Base = C;
       uint64_t Offset = 0;
       if (const auto *GEP = dyn_cast<GEPOperator>(C)) {
@@ -920,6 +932,18 @@ class OS400MIEmitPass : public ModulePass {
               C->getAggregateElement(static_cast<unsigned>(I));
           if (!Elt)
             fail("constant array elements");
+          writeArenaConstantBytes(Elt, Bytes.slice(I * EltSize, EltSize));
+        }
+        return;
+      }
+
+      if (auto *VT = dyn_cast<FixedVectorType>(Ty)) {
+        uint64_t EltSize = DL.getTypeAllocSize(VT->getElementType());
+        for (uint64_t I = 0, E = VT->getNumElements(); I != E; ++I) {
+          const Constant *Elt =
+              C->getAggregateElement(static_cast<unsigned>(I));
+          if (!Elt)
+            fail("constant vector elements");
           writeArenaConstantBytes(Elt, Bytes.slice(I * EltSize, EltSize));
         }
         return;
@@ -1025,24 +1049,26 @@ class OS400MIEmitPass : public ModulePass {
       if (!GV.getValueType()->isPointerTy())
         fail("PTR32 globals");
 
-      std::optional<uint32_t> PointerValue =
-          getConstantPointerValue(GV.getInitializer());
-      if (!PointerValue)
-        fail("PTR32 globals initialized with null or laid-out globals");
-
       uint32_t Size = 4;
       uint32_t Alignment = 4;
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
+      addGlobalObject(GV, Name, "ptr_global", Offset, Size, Alignment,
+                      AccessWidth::I32, false);
+
+      std::optional<uint32_t> PointerValue =
+          getConstantPointerValue(GV.getInitializer());
+      if (!PointerValue)
+        fail("PTR32 globals initialized with null, inttoptr constants, or "
+             "laid-out globals");
+
       SmallVector<uint8_t, 4> Bytes(Size, 0);
       storeIntegerBytes(APInt(32, *PointerValue), Size, Bytes);
       Declarations.push_back("DCL DD " + Name.Name + " CHAR(4) DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ") INIT(X'" +
                              getRawHex(Bytes) + "');");
-      addGlobalObject(GV, Name, "ptr_global", Offset, Size, Alignment,
-                      AccessWidth::I32, false);
       addMapRecord(Name, "ptr_global", std::move(Original), Offset, Size,
                    Alignment, getSourceLocation(GV), "ptr32");
       NextArenaOffset = Offset + Size;
@@ -1084,16 +1110,17 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Alignment = getABIAlignment(DL, ValueTy);
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
 
+      std::string Original = getOriginalName(GV);
+      GeneratedName Name = Names.createGlobalName(Original);
+      addGlobalObject(GV, Name, "aggregate", Offset, Size, Alignment,
+                      AccessWidth::I8, false);
+
       SmallVector<uint8_t, 32> Bytes(Size, 0);
       writeArenaConstantBytes(GV.getInitializer(), Bytes);
 
-      std::string Original = getOriginalName(GV);
-      GeneratedName Name = Names.createGlobalName(Original);
       Declarations.push_back("DCL DD " + Name.Name + " CHAR(" +
                              std::to_string(Size) + ") DEF(C_MEM) POS(" +
                              std::to_string(Offset + 1) + ");");
-      addGlobalObject(GV, Name, "aggregate", Offset, Size, Alignment,
-                      AccessWidth::I8, false);
       std::optional<SourceLocationRecord> Loc = getSourceLocation(GV);
       addMapRecord(Name, "aggregate", std::move(Original), Offset, Size,
                    Alignment, Loc, "raw-bytes");
@@ -1250,6 +1277,7 @@ class OS400MIEmitPass : public ModulePass {
       I64Value I64;
       uint32_t Size = 0;
       uint32_t Alignment = 0;
+      uint32_t FrameOffset = 0;
     };
 
     const Function *F = nullptr;
@@ -1257,10 +1285,11 @@ class OS400MIEmitPass : public ModulePass {
     std::string ReturnPointerName;
     Slot ReturnSlot;
     SmallVector<Slot, 4> Args;
-    std::string VarArgAreaName;
     uint32_t VarArgAreaOffset = 0;
     uint32_t VarArgAreaSize = 0;
     uint32_t MaxVarArgBytes = 0;
+    DenseMap<const AllocaInst *, ArenaSlot> LocalSlots;
+    uint32_t FrameSize = 0;
   };
 
   struct CtorDtorEntry {
@@ -1367,16 +1396,98 @@ class OS400MIEmitPass : public ModulePass {
       Slot.Name = Name.str();
       if (Ty->isVoidTy())
         return Slot;
-      if (isI64Slot(Ty))
+      if (isI64Slot(Ty)) {
         Slot.I64 = makeI64Value(Name);
-      if (isAggregateSlot(Ty)) {
+        Slot.Size = 8;
+        Slot.Alignment = 4;
+      } else if (isAggregateSlot(Ty)) {
         uint64_t Size = DL.getTypeAllocSize(Ty);
         if (Size > std::numeric_limits<uint32_t>::max())
           fail("aggregate call slots no larger than 4 GiB");
         Slot.Size = static_cast<uint32_t>(Size);
         Slot.Alignment = getABIAlignment(DL, Ty);
+      } else {
+        Slot.Size = 4;
+        Slot.Alignment = 4;
       }
       return Slot;
+    }
+
+    static uint32_t getSlotFrameAlignment(const FunctionInfo::Slot &Slot) {
+      return Slot.Alignment ? Slot.Alignment : 4;
+    }
+
+    static uint32_t getSlotFrameSize(const FunctionInfo::Slot &Slot) {
+      return Slot.Size;
+    }
+
+    ArenaSlot makeLocalSlot(const DataLayout &DL, const AllocaInst &AI,
+                            uint32_t Offset) {
+      if (AI.isArrayAllocation())
+        fail("static scalar or integer aggregate allocas");
+
+      Type *AllocatedTy = AI.getAllocatedType();
+      bool ScalarInt = isSupportedParamABIType(AllocatedTy) &&
+                       !isAggregateSlot(AllocatedTy);
+      AccessWidth Width =
+          ScalarInt ? (AllocatedTy->isPointerTy() ? AccessWidth::I32
+                                                  : getIntegerAccessWidth(
+                                                        AllocatedTy))
+                    : AccessWidth::I8;
+      uint32_t Size = 0;
+      if (ScalarInt) {
+        Size = getAccessWidthBytes(Width);
+      } else if (isSupportedArenaValueType(AllocatedTy)) {
+        Size = static_cast<uint32_t>(DL.getTypeAllocSize(AllocatedTy));
+      } else {
+        fail("static scalar or integer aggregate allocas");
+      }
+
+      return ArenaSlot{"", Offset, Size, Width, false};
+    }
+
+    void assignFrameLayout(FunctionInfo &Info) {
+      uint32_t Offset = FirstArenaOffset;
+      auto AssignSlot = [&](FunctionInfo::Slot &Slot) {
+        if (Slot.Ty->isVoidTy())
+          return;
+        Offset = alignTo(Offset, getSlotFrameAlignment(Slot));
+        Slot.FrameOffset = Offset;
+        Offset += getSlotFrameSize(Slot);
+      };
+
+      AssignSlot(Info.ReturnSlot);
+      for (FunctionInfo::Slot &Arg : Info.Args)
+        AssignSlot(Arg);
+
+      if (Info.MaxVarArgBytes) {
+        Offset = alignTo(Offset, 4);
+        Info.VarArgAreaOffset = Offset;
+        Info.VarArgAreaSize = Info.MaxVarArgBytes;
+        Offset += Info.VarArgAreaSize;
+      }
+
+      if (Info.F) {
+        const DataLayout &DL = Info.F->getParent()->getDataLayout();
+        for (const BasicBlock &BB : *Info.F) {
+          for (const Instruction &I : BB) {
+            const auto *AI = dyn_cast<AllocaInst>(&I);
+            if (!AI)
+              continue;
+            Type *AllocatedTy = AI->getAllocatedType();
+            uint32_t Alignment = isSupportedParamABIType(AllocatedTy) &&
+                                         !isAggregateSlot(AllocatedTy)
+                                     ? 4
+                                     : getABIAlignment(DL, AllocatedTy);
+            Offset = alignTo(Offset, Alignment);
+            ArenaSlot Slot = makeLocalSlot(DL, *AI, Offset);
+            Info.LocalSlots[AI] = Slot;
+            Offset += Slot.Size;
+          }
+        }
+      }
+
+      Info.FrameSize = alignTo(Offset, 16);
     }
 
     void addMapRecord(const GeneratedName &Name, const Function &F,
@@ -1494,7 +1605,7 @@ class OS400MIEmitPass : public ModulePass {
 
       unsigned &State = VisitState[&F];
       if (State == 1)
-        fail("acyclic direct calls; recursion requires a software stack");
+        return;
       if (State == 2)
         return;
 
@@ -1611,42 +1722,9 @@ class OS400MIEmitPass : public ModulePass {
       for (const CtorDtorEntry &Entry : Destructors)
         visitFunction(*Entry.F, false);
 
-      uint32_t NextStackOffset = FirstArenaOffset;
       for (const Function *F : Functions) {
         FunctionInfo &Info = Infos[F];
-        if (Info.MaxVarArgBytes == 0)
-          continue;
-        uint32_t Offset = alignTo(NextStackOffset, 4);
-        if (Offset + Info.MaxVarArgBytes > StackSize)
-          fail("phase-1 vararg save areas within 256-byte C stack");
-        GeneratedName AreaName =
-            Names.createSlotName(Info.EntryName + "_varargs");
-        Info.VarArgAreaName = AreaName.Name;
-        Info.VarArgAreaOffset = Offset;
-        Info.VarArgAreaSize = Info.MaxVarArgBytes;
-        Declarations.push_back("DCL     DD          " + Info.VarArgAreaName +
-                               "    CHAR(" +
-                               std::to_string(Info.VarArgAreaSize) +
-                               ")    DEF(C_STACK) POS(" +
-                               std::to_string(Offset + 1) + ");");
-        MapRecords.push_back({AreaName.Name,
-                              "vararg_save_area",
-                              AreaName.Class,
-                              getOriginalName(*F),
-                              AreaName.Ordinal,
-                              AreaName.Collision
-                                  ? std::optional<uint32_t>(
-                                        AreaName.CollisionOrdinal)
-                                  : std::nullopt,
-                              AreaName.Collision,
-                              NameAllocator::getMaxMINameLength(),
-                              AreaName.Hash,
-                              getSourceLocation(*F),
-                              Offset,
-                              Info.VarArgAreaSize,
-                              4,
-                              "stack-region;caller-filled;slot-align=4"});
-        NextStackOffset = Offset + Info.VarArgAreaSize;
+        assignFrameLayout(Info);
       }
 
       // Whole-program hosted links can leave unused definitions from selected
@@ -1666,13 +1744,7 @@ class OS400MIEmitPass : public ModulePass {
     ArrayRef<CtorDtorEntry> getDestructors() const { return Destructors; }
 
     uint32_t getInitialStackOffset() const {
-      uint32_t Offset = FirstArenaOffset;
-      for (const Function *F : Functions) {
-        const FunctionInfo &Info = getInfo(*F);
-        if (Info.VarArgAreaSize)
-          Offset = std::max(Offset, Info.VarArgAreaOffset + Info.VarArgAreaSize);
-      }
-      return Offset;
+      return FirstArenaOffset;
     }
 
     const FunctionInfo &getInfo(const Function &F) const {
@@ -1713,6 +1785,7 @@ class OS400MIEmitPass : public ModulePass {
     uint32_t NextArenaOffset;
     uint32_t NextStackOffset = FirstArenaOffset;
     uint32_t NextCallBarrier = 1;
+    uint32_t RequiredStackSize = MinStackSize;
     bool HasLoadStoreLens = false;
     bool HasU1Box = false;
     bool HasNativeByteLens = false;
@@ -1808,9 +1881,9 @@ class OS400MIEmitPass : public ModulePass {
                             FrameOffset,
                             FrameSize,
                             4,
-                            "stack-region;activation=per-function;"
-                            "reentrant=false;recursion=unsupported;"
-                            "future=software-stack"});
+                            "stack-region;activation=runtime-frame;"
+                            "reentrant=true;recursion=supported;"
+                            "frame-base=FRAME_BASE;stack-top=STACK_TOP"});
     }
 
     void addCallAliasBarrierRecord(const CallBase &CB,
@@ -1844,14 +1917,23 @@ class OS400MIEmitPass : public ModulePass {
       addCallAliasBarrierRecord(CB, CalleeInfo);
     }
 
-    std::string getOperandName(const Value *V) const {
+    std::string getOperandName(const Value *V) {
       if (V->getType()->isPointerTy()) {
         auto It = Values.find(V);
         if (It != Values.end())
           return It->second;
         if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
           return *Offset;
-        fail("PTR32 operands defined by arena pointers or previous loads");
+        if (const auto *I = dyn_cast<Instruction>(V)) {
+          std::string Dest = createTemp(*I);
+          Values[I] = Dest;
+          return Dest;
+        }
+        std::string ValueText;
+        raw_string_ostream OS(ValueText);
+        V->print(OS);
+        fail("PTR32 operands defined by arena pointers or previous loads; "
+             "unsupported value " + OS.str());
       }
 
       if (const auto *CI = dyn_cast<ConstantInt>(V)) {
@@ -1866,6 +1948,15 @@ class OS400MIEmitPass : public ModulePass {
 
       auto It = Values.find(V);
       if (It == Values.end()) {
+        if (const auto *I = dyn_cast<Instruction>(V)) {
+          Type *Ty = I->getType();
+          if (Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+              Ty->isIntegerTy(16) || Ty->isIntegerTy(32)) {
+            std::string Dest = createTemp(*I);
+            Values[I] = Dest;
+            return Dest;
+          }
+        }
         std::string ValueText;
         raw_string_ostream OS(ValueText);
         V->print(OS);
@@ -2095,15 +2186,22 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     std::optional<uint32_t> getBasePointerValue(const Value *V) const {
+      if (std::optional<ArenaSlot> Slot = Layout.getGlobalSlot(V))
+        return StaticRegionTag + Slot->Offset;
+
+      return std::nullopt;
+    }
+
+    std::optional<std::string> getBasePointerName(const Value *V) {
       if (const auto *AI = dyn_cast<AllocaInst>(V)) {
         auto It = Slots.find(AI);
         if (It == Slots.end())
           return std::nullopt;
-        return StackRegionTag + It->second.Offset;
+        return getFramePointerValue("FRAME_BASE", It->second.Offset);
       }
 
-      if (std::optional<ArenaSlot> Slot = Layout.getGlobalSlot(V))
-        return StaticRegionTag + Slot->Offset;
+      if (std::optional<uint32_t> PointerValue = getBasePointerValue(V))
+        return std::to_string(*PointerValue);
 
       return std::nullopt;
     }
@@ -2346,14 +2444,17 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     ArenaSlot createAggregateTemp(const Value &V, Type *Ty, StringRef Kind) {
-      if (!isSupportedArenaValueType(Ty))
-        fail("integer array/struct aggregate values");
+      if (!isSupportedArenaValueType(Ty)) {
+        std::string TypeText;
+        raw_string_ostream OS(TypeText);
+        Ty->print(OS);
+        fail("integer array/struct aggregate values; unsupported type " +
+             OS.str());
+      }
 
       uint32_t Size = static_cast<uint32_t>(DL.getTypeAllocSize(Ty));
       uint32_t Alignment = getABIAlignment(DL, Ty);
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(V);
       GeneratedName SlotName = Names.createSlotName(Original);
@@ -2437,23 +2538,31 @@ class OS400MIEmitPass : public ModulePass {
     void lowerNarrowBinaryOperator(const BinaryOperator &BO) {
       Type *Ty = BO.getType();
       unsigned Bits = cast<IntegerType>(Ty)->getBitWidth();
-      if (Bits != 8 && Bits != 16)
-        fail("i8/i16 arithmetic, bitwise, and shift expressions");
+      if (Bits != 1 && Bits != 8 && Bits != 16)
+        fail("i1/i8/i16 arithmetic, bitwise, and shift expressions");
 
-      std::string Dest = createTemp(BO);
+      auto Existing = Values.find(&BO);
+      std::string Dest =
+          Existing != Values.end() ? Existing->second : createTemp(BO);
       std::string LHS = getOperandName(BO.getOperand(0));
       std::string RHS = getOperandName(BO.getOperand(1));
 
       switch (BO.getOpcode()) {
       case Instruction::Add:
+        if (Bits == 1)
+          fail("i8/i16 arithmetic and i1/i8/i16 bitwise expressions");
         Body.push_back("        ADDN        " + Dest + "," + LHS + "," + RHS +
                        ";");
         break;
       case Instruction::Sub:
+        if (Bits == 1)
+          fail("i8/i16 arithmetic and i1/i8/i16 bitwise expressions");
         Body.push_back("        SUBN        " + Dest + "," + LHS + "," + RHS +
                        ";");
         break;
       case Instruction::Mul:
+        if (Bits == 1)
+          fail("i8/i16 arithmetic and i1/i8/i16 bitwise expressions");
         Body.push_back("        MULT        " + Dest + "," + LHS + "," + RHS +
                        ";");
         break;
@@ -2544,7 +2653,8 @@ class OS400MIEmitPass : public ModulePass {
       if (isI32(V->getType()))
         return getI32ByteOperandName(V);
 
-      if (V->getType()->isIntegerTy(8) || V->getType()->isIntegerTy(16)) {
+      if (V->getType()->isIntegerTy(1) || V->getType()->isIntegerTy(8) ||
+          V->getType()->isIntegerTy(16)) {
         std::string Temp = createAnonymousTemp("narrow_bitwise_operand");
         Body.push_back("        CPYNV       " + Temp + "," +
                        getOperandName(V) + ";");
@@ -2553,7 +2663,7 @@ class OS400MIEmitPass : public ModulePass {
         return Temp + "B";
       }
 
-      fail("i8/i16/i32 bitwise operands");
+      fail("i1/i8/i16/i32 bitwise operands");
       llvm_unreachable("fail should not return");
     }
 
@@ -2951,51 +3061,16 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerAlloca(const AllocaInst &AI) {
-      if (AI.isArrayAllocation())
-        fail("static scalar or integer aggregate allocas");
-
-      Type *AllocatedTy = AI.getAllocatedType();
-      bool ScalarInt = isSupportedInt(AllocatedTy) || isPTR32(AllocatedTy);
-      AccessWidth Width =
-          ScalarInt ? getAccessWidth(AllocatedTy) : AccessWidth::I8;
-      uint32_t Size = 0;
-      if (ScalarInt) {
-        Size = getAccessWidthBytes(Width);
-      } else if (isSupportedArenaAggregateType(AllocatedTy)) {
-        Size = static_cast<uint32_t>(DL.getTypeAllocSize(AllocatedTy));
-      } else {
-        fail("static scalar or integer aggregate allocas");
-      }
-
-      uint32_t Alignment = ScalarInt ? 4 : getABIAlignment(DL, AllocatedTy);
-      uint32_t Offset =
-          ScalarInt ? alignTo4(NextStackOffset)
-                    : static_cast<uint32_t>(alignTo(NextStackOffset, Alignment));
-      if (Offset + Size > StackSize)
-        fail("phase-1 stack storage within 256 bytes");
-
       std::string Original = getOriginalName(AI);
       GeneratedName SlotName = Names.createSlotName(Original);
-      ArenaSlot Slot{SlotName.Name, Offset, Size, Width,
-                     ScalarInt && Width != AccessWidth::I64};
-      NextStackOffset = Offset + Size;
+      auto It = CurrentFunction->LocalSlots.find(&AI);
+      if (It == CurrentFunction->LocalSlots.end())
+        fail("planned static scalar or integer aggregate allocas");
+      ArenaSlot Slot = It->second;
+      Slot.Name = SlotName.Name;
       Slots[&AI] = Slot;
-      if (ScalarInt && Width == AccessWidth::I32) {
-        Declarations.push_back("DCL     DD          " + Slot.Name +
-                               "    BIN(4)     DEF(C_STACK) POS(" +
-                               std::to_string(Slot.Offset + 1) + ");");
-      } else if (ScalarInt && Width == AccessWidth::I16) {
-        Declarations.push_back("DCL     DD          " + Slot.Name +
-                               "    BIN(2)     UNSGND DEF(C_STACK) POS(" +
-                               std::to_string(Slot.Offset + 1) + ");");
-      } else {
-        Declarations.push_back("DCL     DD          " + Slot.Name +
-                               "    CHAR(" + std::to_string(Size) +
-                               ")    DEF(C_STACK) POS(" +
-                               std::to_string(Slot.Offset + 1) + ");");
-      }
       addMapRecord(SlotName, "local", std::move(Original),
-                   getSourceLocation(AI), Slot.Offset, Size, Alignment);
+                   getSourceLocation(AI), Slot.Offset, Slot.Size, 4);
     }
 
     void lowerBinaryOperator(const BinaryOperator &BO) {
@@ -3004,7 +3079,8 @@ class OS400MIEmitPass : public ModulePass {
         return;
       }
 
-      if (BO.getType()->isIntegerTy(8) || BO.getType()->isIntegerTy(16)) {
+      if (BO.getType()->isIntegerTy(1) || BO.getType()->isIntegerTy(8) ||
+          BO.getType()->isIntegerTy(16)) {
         lowerNarrowBinaryOperator(BO);
         return;
       }
@@ -3288,12 +3364,97 @@ class OS400MIEmitPass : public ModulePass {
       return Dest;
     }
 
-    std::optional<std::string> tryGetPointerOffsetName(const Value *V) const {
+    bool lowerScalarIntrinsic(const IntrinsicInst &II) {
+      Intrinsic::ID ID = II.getIntrinsicID();
+      auto IsI32BinaryIntrinsic = [&]() {
+        return II.arg_size() == 2 && II.getType()->isIntegerTy(32) &&
+               II.getArgOperand(0)->getType()->isIntegerTy(32) &&
+               II.getArgOperand(1)->getType()->isIntegerTy(32);
+      };
+
+      auto EmitMinMax = [&](CmpInst::Predicate KeepLHS) {
+        if (!IsI32BinaryIntrinsic())
+          fail("i32 min/max intrinsic signature");
+        std::string Dest = createTemp(II);
+        std::string LHS = getCompareOperandName(II.getArgOperand(0),
+                                                CmpInst::isSigned(KeepLHS));
+        std::string RHS = getCompareOperandName(II.getArgOperand(1),
+                                                CmpInst::isSigned(KeepLHS));
+        GeneratedName KeepName = Names.createBlockName();
+        GeneratedName DoneName = Names.createBlockName();
+        std::string KeepLabel = KeepName.Name;
+        std::string DoneLabel = DoneName.Name;
+        addMapRecord(KeepName, "intrinsic_minmax_keep_lhs", "",
+                     getSourceLocation(II));
+        addMapRecord(DoneName, "intrinsic_minmax_done", "",
+                     getSourceLocation(II));
+
+        Body.push_back("        CPYNV       " + Dest + "," +
+                       getOperandName(II.getArgOperand(1)) + ";");
+        Body.push_back("        CMPNV(B)    " + LHS + "," + RHS + "/" +
+                       getBranchPredicate(KeepLHS).str() + "(" + KeepLabel +
+                       ");");
+        Body.push_back("        B           " + DoneLabel + ";");
+        Body.push_back(KeepLabel + ":");
+        Body.push_back("        CPYNV       " + Dest + "," +
+                       getOperandName(II.getArgOperand(0)) + ";");
+        Body.push_back(DoneLabel + ":");
+        Values[&II] = Dest;
+      };
+
+      switch (ID) {
+      case Intrinsic::smax:
+        EmitMinMax(CmpInst::ICMP_SGT);
+        return true;
+      case Intrinsic::smin:
+        EmitMinMax(CmpInst::ICMP_SLT);
+        return true;
+      case Intrinsic::umax:
+        EmitMinMax(CmpInst::ICMP_UGT);
+        return true;
+      case Intrinsic::umin:
+        EmitMinMax(CmpInst::ICMP_ULT);
+        return true;
+      case Intrinsic::usub_sat: {
+        if (!IsI32BinaryIntrinsic())
+          fail("i32 usub_sat intrinsic signature");
+        std::string Dest = createTemp(II);
+        std::string LHS = getOperandName(II.getArgOperand(0));
+        std::string RHS = getOperandName(II.getArgOperand(1));
+        GeneratedName DoneName = Names.createBlockName();
+        std::string DoneLabel = DoneName.Name;
+        addMapRecord(DoneName, "intrinsic_usub_sat_done", "",
+                     getSourceLocation(II));
+
+        Body.push_back("        CPYNV       " + Dest + ",0;");
+        Body.push_back("        CMPNV(B)    " + LHS + "," + RHS + "/LO(" +
+                       DoneLabel + ");");
+        Body.push_back("        SUBN        " + Dest + "," + LHS + "," +
+                       RHS + ";");
+        Body.push_back(DoneLabel + ":");
+        Values[&II] = Dest;
+        return true;
+      }
+      default:
+        return false;
+      }
+    }
+
+    std::optional<std::string> tryGetPointerOffsetName(const Value *V) {
       if (isa<ConstantPointerNull>(V))
         return "0";
 
-      if (std::optional<uint32_t> PointerValue = getBasePointerValue(V))
-        return std::to_string(*PointerValue);
+      if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+        if (CE->getOpcode() == Instruction::IntToPtr) {
+          const auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0));
+          if (!CI)
+            return std::nullopt;
+          return std::to_string(CI->getValue().trunc(32).getZExtValue());
+        }
+      }
+
+      if (std::optional<std::string> PointerValue = getBasePointerName(V))
+        return *PointerValue;
 
       auto It = Values.find(V);
       if (It != Values.end())
@@ -3303,16 +3464,17 @@ class OS400MIEmitPass : public ModulePass {
         const Value *Base = GEP->getPointerOperand();
         APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
         if (GEP->accumulateConstantOffset(DL, ConstantOffset)) {
-          if (std::optional<uint32_t> BasePointer = getBasePointerValue(Base))
-            return std::to_string(*BasePointer +
-                                  ConstantOffset.getZExtValue());
+          if (std::optional<std::string> BasePointer =
+                  getBasePointerName(Base))
+            return addStaticOffset("ptr_offset", *BasePointer,
+                                   ConstantOffset.getZExtValue());
         }
       }
 
       return std::nullopt;
     }
 
-    std::string getPointerOffsetName(const Value *V) const {
+    std::string getPointerOffsetName(const Value *V) {
       if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
         return *Offset;
       std::string ValueText;
@@ -3356,6 +3518,10 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        ADDN        " + Dest + "," + Base.str() + "," +
                      std::to_string(Offset) + ";");
       return Dest;
+    }
+
+    std::string getFramePointerValue(StringRef FrameBase, uint32_t Offset) {
+      return addStaticOffset("frame_ptr", FrameBase, StackRegionTag + Offset);
     }
 
     void lowerGetElementPtr(const GetElementPtrInst &GEP) {
@@ -4393,7 +4559,9 @@ class OS400MIEmitPass : public ModulePass {
 
       AccessWidth Width = getAccessWidth(LI.getType());
 
-      std::string Dest = createTemp(LI);
+      auto ExistingLoad = Values.find(&LI);
+      std::string Dest =
+          ExistingLoad != Values.end() ? ExistingLoad->second : createTemp(LI);
       if (std::optional<ArenaSlot> Slot =
               getDirectScalarSlot(LI.getPointerOperand())) {
         if (Slot->Width == Width) {
@@ -4587,7 +4755,9 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       std::string Src = getOperandName(SI.getOperand(0));
-      std::string Dest = createTemp(SI);
+      auto ExistingSelect = Values.find(&SI);
+      std::string Dest = ExistingSelect != Values.end() ? ExistingSelect->second
+                                                        : createTemp(SI);
       GeneratedName DoneName = Names.createBlockName();
       std::string DoneLabel = DoneName.Name;
       addMapRecord(DoneName, "sext_done", "", getSourceLocation(SI));
@@ -4604,20 +4774,52 @@ class OS400MIEmitPass : public ModulePass {
     }
 
     void lowerTrunc(const TruncInst &TI) {
-      if (!TI.getOperand(0)->getType()->isIntegerTy(64) ||
-          !TI.getType()->isIntegerTy(32))
-        fail("trunc from i64 to i32");
+      Type *SrcTy = TI.getOperand(0)->getType();
+      Type *DestTy = TI.getType();
+      if (SrcTy->isIntegerTy(64) && DestTy->isIntegerTy(32)) {
+        I64Value Src = getI64Operand(TI.getOperand(0));
+        std::string Dest = createTemp(TI);
+        Body.push_back("        CPYBLA      " + Dest + "B," + Src.LoBytes +
+                       ";");
+        Values[&TI] = Dest;
+        return;
+      }
 
-      I64Value Src = getI64Operand(TI.getOperand(0));
+      if (!SrcTy->isIntegerTy(32) ||
+          !(DestTy->isIntegerTy(1) || DestTy->isIntegerTy(8) ||
+            DestTy->isIntegerTy(16)))
+        fail("trunc from i64 to i32 or i32 to i1/i8/i16");
+
       std::string Dest = createTemp(TI);
-      Body.push_back("        CPYBLA      " + Dest + "B," + Src.LoBytes + ";");
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getOperandName(TI.getOperand(0)) + ";");
+      maskIntegerSlotToType(Dest, DestTy);
       Values[&TI] = Dest;
     }
 
-    void lowerPtrToInt(const PtrToIntInst &PI) {
+    void lowerFreeze(const FreezeInst &FI) {
+      Type *Ty = FI.getType();
+      if (Ty->isIntegerTy(64)) {
+        I64Value Dest = createI64Temp(FI);
+        emitI64Copy(Dest, getI64Operand(FI.getOperand(0)));
+        I64Values[&FI] = Dest;
+        return;
+      }
+
+      if (!(Ty->isIntegerTy(1) || Ty->isIntegerTy(8) ||
+            Ty->isIntegerTy(16) || Ty->isIntegerTy(32) || Ty->isPointerTy()))
+        fail("freeze of i1/i8/i16/i32/i64/PTR32 values");
+
+      std::string Dest = createTemp(FI);
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getOperandName(FI.getOperand(0)) + ";");
+      Values[&FI] = Dest;
+    }
+
+    void lowerPtrToI32(const CastInst &PI, StringRef Kind) {
       if (!PI.getOperand(0)->getType()->isPointerTy() ||
           !PI.getType()->isIntegerTy(32))
-        fail("ptrtoint from PTR32 to i32");
+        fail(Kind + " from PTR32 to i32");
 
       auto ValueIt = Values.find(&PI);
       std::string Dest =
@@ -4625,6 +4827,14 @@ class OS400MIEmitPass : public ModulePass {
       Values[&PI] = Dest;
       Body.push_back("        CPYNV       " + Dest + "," +
                      getOperandName(PI.getOperand(0)) + ";");
+    }
+
+    void lowerPtrToInt(const PtrToIntInst &PI) {
+      lowerPtrToI32(PI, "ptrtoint");
+    }
+
+    void lowerPtrToAddr(const PtrToAddrInst &PI) {
+      lowerPtrToI32(PI, "ptrtoaddr");
     }
 
     void lowerSelect(const SelectInst &SI) {
@@ -4703,6 +4913,8 @@ class OS400MIEmitPass : public ModulePass {
           lowerVACopy(CB);
           return;
         }
+        if (lowerScalarIntrinsic(*II))
+          return;
         fail("supported LLVM intrinsics");
       }
 
@@ -4734,21 +4946,43 @@ class OS400MIEmitPass : public ModulePass {
         const FunctionInfo::Slot &ArgSlot = CalleeInfo.Args[I];
         if (ArgSlot.Ty != Arg->getType())
           fail("direct function call arguments matching callee signature");
+      }
+
+      std::string SavedFrame = createAnonymousTemp("saved_frame_base");
+      std::string CallFrame = createAnonymousTemp("call_frame_base");
+      Body.push_back("        CPYNV       " + SavedFrame + ",FRAME_BASE;");
+      Body.push_back("        CPYNV       " + CallFrame + ",STACK_TOP;");
+      Body.push_back("        ADDN        STACK_TOP,STACK_TOP," +
+                     std::to_string(CalleeInfo.FrameSize) + ";");
+      Body.push_back("        CPYNV       FRAME_BASE," + CallFrame + ";");
+
+      for (unsigned I = 0, E = CalleeInfo.Args.size(); I != E; ++I) {
+        const Value *Arg = CB.getArgOperand(I);
+        const FunctionInfo::Slot &ArgSlot = CalleeInfo.Args[I];
+        std::string ArgPtr =
+            getFramePointerValue(CallFrame, ArgSlot.FrameOffset);
 
         if (Arg->getType()->isIntegerTy(64)) {
-          Body.push_back("        CPYBLA      " + ArgSlot.I64.Bytes + "," +
-                         getI64Operand(Arg).Bytes + ";");
+          emitStoreI64ToPointerValue(ArgPtr, getI64Operand(Arg));
           continue;
         }
 
         if (isAggregateABIType(Arg->getType())) {
-          copyAggregateValueToName(Arg, ArgSlot.Name);
+          ArenaSlot Source = materializeAggregateSlot(Arg, "call_arg");
+          ensureU1Box();
+          for (uint32_t J = 0; J != Source.Size; ++J) {
+            emitSetLensPointerFromOffset(
+                getPointerOffsetPlus(std::to_string(Source.Offset), J));
+            Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+            emitSetLensPointerFromPointerValue(getPointerOffsetPlus(ArgPtr, J));
+            Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+          }
           continue;
         }
 
-        Body.push_back("        CPYNV       " + ArgSlot.Name + "," +
-                       getOperandName(Arg) + ";");
-        maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
+        emitSetLensPointerFromPointerValue(ArgPtr);
+        emitStoreToReference(getLensName(getAccessWidth(Arg->getType())),
+                             getAccessWidth(Arg->getType()), Arg);
       }
 
       if (CalleeTy->isVarArg()) {
@@ -4760,7 +4994,9 @@ class OS400MIEmitPass : public ModulePass {
           VarArgOffset = alignTo(VarArgOffset, 4);
           if (VarArgOffset + SlotSize > CalleeInfo.VarArgAreaSize)
             fail("planned vararg save area large enough for direct call");
-          emitStoreVarArgValue(CalleeInfo.VarArgAreaOffset + VarArgOffset, Arg);
+          std::string VarArgPtr = getFramePointerValue(
+              CallFrame, CalleeInfo.VarArgAreaOffset + VarArgOffset);
+          emitStoreVarArgValue(VarArgPtr, Arg);
           VarArgOffset += SlotSize;
         }
       }
@@ -4768,30 +5004,50 @@ class OS400MIEmitPass : public ModulePass {
       invalidateCallAliasedMemory(CB, CalleeInfo);
       Body.push_back("        CALLI       " + CalleeInfo.EntryName +
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
-      if (CB.getType()->isVoidTy())
+      if (CB.getType()->isVoidTy()) {
+        Body.push_back("        CPYNV       STACK_TOP," + CallFrame + ";");
+        Body.push_back("        CPYNV       FRAME_BASE," + SavedFrame + ";");
         return;
+      }
+
+      std::string ReturnPtr =
+          getFramePointerValue(CallFrame, CalleeInfo.ReturnSlot.FrameOffset);
 
       if (CB.getType()->isIntegerTy(64)) {
         I64Value Dest = createI64Temp(CB, "call_result");
-        Body.push_back("        CPYBLA      " + Dest.Bytes + "," +
-                       CalleeInfo.ReturnSlot.I64.Bytes + ";");
+        emitLoadI64FromPointerValue(Dest, ReturnPtr);
         I64Values[&CB] = Dest;
+        Body.push_back("        CPYNV       STACK_TOP," + CallFrame + ";");
+        Body.push_back("        CPYNV       FRAME_BASE," + SavedFrame + ";");
         return;
       }
 
       if (isAggregateABIType(CB.getType())) {
         ArenaSlot Dest = createAggregateTemp(CB, CB.getType(), "call_result");
-        Body.push_back("        CPYBLA      " + Dest.Name + "," +
-                       CalleeInfo.ReturnSlot.Name + ";");
+        ensureU1Box();
+        for (uint32_t I = 0; I != Dest.Size; ++I) {
+          emitSetLensPointerFromPointerValue(getPointerOffsetPlus(ReturnPtr, I));
+          Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+          emitSetLensPointerFromOffset(
+              getPointerOffsetPlus(std::to_string(Dest.Offset), I));
+          Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+        }
         AggregateValues[&CB] = Dest;
+        Body.push_back("        CPYNV       STACK_TOP," + CallFrame + ";");
+        Body.push_back("        CPYNV       FRAME_BASE," + SavedFrame + ";");
         return;
       }
 
-      std::string Dest = createTemp(CB);
-      Body.push_back("        CPYNV       " + Dest + "," +
-                     CalleeInfo.ReturnSlot.Name + ";");
+      auto ExistingCall = Values.find(&CB);
+      std::string Dest =
+          ExistingCall != Values.end() ? ExistingCall->second : createTemp(CB);
+      emitSetLensPointerFromPointerValue(ReturnPtr);
+      emitLoadFromReference(Dest, getLensName(getAccessWidth(CB.getType())),
+                            getAccessWidth(CB.getType()));
       maskIntegerSlotToType(Dest, CB.getType());
       Values[&CB] = Dest;
+      Body.push_back("        CPYNV       STACK_TOP," + CallFrame + ";");
+      Body.push_back("        CPYNV       FRAME_BASE," + SavedFrame + ";");
     }
 
     void emitDirectCall(const Function &Callee) {
@@ -4804,9 +5060,8 @@ class OS400MIEmitPass : public ModulePass {
                      ", *, " + CalleeInfo.ReturnPointerName + ";");
     }
 
-    void emitStoreVarArgValue(uint32_t Offset, const Value *Arg) {
+    void emitStoreVarArgValue(StringRef PtrValue, const Value *Arg) {
       Type *Ty = Arg->getType();
-      std::string PtrValue = std::to_string(StackRegionTag + Offset);
       if (Ty->isIntegerTy(64)) {
         emitStoreI64ToPointerValue(PtrValue, getI64Operand(Arg));
         return;
@@ -4829,7 +5084,7 @@ class OS400MIEmitPass : public ModulePass {
                             : FirstArenaOffset;
       emitSetLensPointer(CB.getArgOperand(0));
       Body.push_back("        CPYNV       LS_I4," +
-                     std::to_string(StackRegionTag + Offset) + ";");
+                     getFramePointerValue("FRAME_BASE", Offset) + ";");
     }
 
     void lowerVACopy(const CallBase &CB) {
@@ -4886,18 +5141,34 @@ class OS400MIEmitPass : public ModulePass {
 
       if (!Ret || Ret->getType() != CurrentFunction->ReturnSlot.Ty)
         fail("returns matching lowered function signature");
+      if (CurrentFunction->EntryName == "MAIN") {
+        if (!Ret->getType()->isIntegerTy(32))
+          fail("i32 main return");
+        Body.push_back("        CPYNV       MAIN_RC," + getOperandName(Ret) +
+                       ";");
+        Body.push_back("        B           " +
+                       CurrentFunction->ReturnPointerName + ";");
+        return;
+      }
+      std::string ReturnPtr =
+          getFramePointerValue("FRAME_BASE",
+                               CurrentFunction->ReturnSlot.FrameOffset);
       if (Ret->getType()->isIntegerTy(64)) {
-        Body.push_back("        CPYBLA      " +
-                       CurrentFunction->ReturnSlot.I64.Bytes + "," +
-                       getI64Operand(Ret).Bytes + ";");
+        emitStoreI64ToPointerValue(ReturnPtr, getI64Operand(Ret));
       } else if (isAggregateABIType(Ret->getType())) {
-        copyAggregateValueToName(Ret, CurrentFunction->ReturnSlot.Name);
+        ArenaSlot Source = materializeAggregateSlot(Ret, "return_value");
+        ensureU1Box();
+        for (uint32_t I = 0; I != Source.Size; ++I) {
+          emitSetLensPointerFromOffset(
+              getPointerOffsetPlus(std::to_string(Source.Offset), I));
+          Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+          emitSetLensPointerFromPointerValue(getPointerOffsetPlus(ReturnPtr, I));
+          Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+        }
       } else {
-        Body.push_back("        CPYNV       " +
-                       CurrentFunction->ReturnSlot.Name + "," +
-                       getOperandName(Ret) + ";");
-        maskIntegerSlotToType(CurrentFunction->ReturnSlot.Name,
-                              CurrentFunction->ReturnSlot.Ty);
+        emitSetLensPointerFromPointerValue(ReturnPtr);
+        emitStoreToReference(getLensName(getAccessWidth(Ret->getType())),
+                             getAccessWidth(Ret->getType()), Ret);
       }
       Body.push_back("        B           " + CurrentFunction->ReturnPointerName +
                      ";");
@@ -4914,6 +5185,25 @@ class OS400MIEmitPass : public ModulePass {
       Body.push_back("        B           " +
                      getEdgeTarget(BI.getParent(), BI.getSuccessor(1)) +
                      ";");
+    }
+
+    void lowerSwitch(const SwitchInst &SI) {
+      Type *ConditionTy = SI.getCondition()->getType();
+      if (!ConditionTy->isIntegerTy(8) && !ConditionTy->isIntegerTy(16) &&
+          !ConditionTy->isIntegerTy(32))
+        fail("i8/i16/i32 switch conditions");
+
+      std::string Condition = getCompareOperandName(SI.getCondition(), false);
+      for (const auto &Case : SI.cases()) {
+        const ConstantInt *Value = Case.getCaseValue();
+        std::string CaseValue = getCompareOperandName(Value, false);
+        Body.push_back("        CMPNV(B)    " + Condition + "," + CaseValue +
+                       "/EQ(" +
+                       getEdgeTarget(SI.getParent(), Case.getCaseSuccessor()) +
+                       ");");
+      }
+      Body.push_back("        B           " +
+                     getEdgeTarget(SI.getParent(), SI.getDefaultDest()) + ";");
     }
 
     bool hasPHIs(const BasicBlock *BB) const {
@@ -4955,6 +5245,8 @@ class OS400MIEmitPass : public ModulePass {
 
     void lower(const Function &F) {
       CurrentFunction = &FunctionPlan.getInfo(F);
+      RequiredStackSize = std::max(RequiredStackSize,
+                                   CurrentFunction->FrameSize + 4096);
       Values.clear();
       I64Values.clear();
       AggregateValues.clear();
@@ -4972,23 +5264,38 @@ class OS400MIEmitPass : public ModulePass {
 
       Body.push_back("ENTRY " + CurrentFunction->EntryName + " INT;");
 
-      uint32_t FrameOffset = NextStackOffset;
       unsigned ArgIndex = 0;
       for (const Argument &Arg : F.args()) {
         const FunctionInfo::Slot &ArgSlot = CurrentFunction->Args[ArgIndex++];
         if (Arg.getType() != ArgSlot.Ty)
           fail("function arguments matching lowered function signature");
         if (Arg.getType()->isIntegerTy(64)) {
-          I64Values[&Arg] = ArgSlot.I64;
+          I64Value Dest = createI64Temp(Arg, "arg");
+          emitLoadI64FromPointerValue(
+              Dest, getFramePointerValue("FRAME_BASE", ArgSlot.FrameOffset));
+          I64Values[&Arg] = Dest;
         } else if (isAggregateABIType(Arg.getType())) {
           ArenaSlot Slot =
               createAggregateTemp(Arg, Arg.getType(), "aggregate_arg");
-          Body.push_back("        CPYBLA      " + Slot.Name + "," +
-                         ArgSlot.Name + ";");
+          ensureU1Box();
+          std::string SourceBase =
+              getFramePointerValue("FRAME_BASE", ArgSlot.FrameOffset);
+          for (uint32_t I = 0; I != Slot.Size; ++I) {
+            emitSetLensPointerFromPointerValue(getPointerOffsetPlus(SourceBase, I));
+            Body.push_back("        CPYBLA      U1_BYTE,LS_I1;");
+            emitSetLensPointerFromOffset(
+                getPointerOffsetPlus(std::to_string(Slot.Offset), I));
+            Body.push_back("        CPYBLA      LS_I1,U1_BYTE;");
+          }
           AggregateValues[&Arg] = Slot;
         } else {
-          maskIntegerSlotToType(ArgSlot.Name, ArgSlot.Ty);
-          Values[&Arg] = ArgSlot.Name;
+          std::string Dest = createTemp(Arg);
+          emitSetLensPointerFromPointerValue(
+              getFramePointerValue("FRAME_BASE", ArgSlot.FrameOffset));
+          emitLoadFromReference(Dest, getLensName(getAccessWidth(Arg.getType())),
+                                getAccessWidth(Arg.getType()));
+          maskIntegerSlotToType(Dest, ArgSlot.Ty);
+          Values[&Arg] = Dest;
         }
       }
 
@@ -4999,9 +5306,11 @@ class OS400MIEmitPass : public ModulePass {
                      getSourceLocation(BB));
         BlockLabels[&BB] = Label.Name;
         for (const PHINode &PN : BB.phis()) {
-          if (!PN.getType()->isIntegerTy(1) && !isI32Like(PN.getType()) &&
+          if (!PN.getType()->isIntegerTy(1) &&
+              !PN.getType()->isIntegerTy(8) &&
+              !PN.getType()->isIntegerTy(16) && !isI32Like(PN.getType()) &&
               !PN.getType()->isIntegerTy(64))
-            fail("i1/i32/PTR32/i64 phi nodes");
+            fail("i1/i8/i16/i32/PTR32/i64 phi nodes");
           BlockPHIs[&BB].push_back(&PN);
           if (PN.getType()->isIntegerTy(64))
             I64Values[&PN] = createI64Temp(PN);
@@ -5012,6 +5321,8 @@ class OS400MIEmitPass : public ModulePass {
           if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I))
             Values[GEP] = createTemp(*GEP);
           else if (const auto *PI = dyn_cast<PtrToIntInst>(&I))
+            Values[PI] = createTemp(*PI);
+          else if (const auto *PI = dyn_cast<PtrToAddrInst>(&I))
             Values[PI] = createTemp(*PI);
         }
       }
@@ -5040,8 +5351,12 @@ class OS400MIEmitPass : public ModulePass {
             lowerSExt(*SI);
           } else if (const auto *TI = dyn_cast<TruncInst>(&I)) {
             lowerTrunc(*TI);
+          } else if (const auto *FI = dyn_cast<FreezeInst>(&I)) {
+            lowerFreeze(*FI);
           } else if (const auto *PI = dyn_cast<PtrToIntInst>(&I)) {
             lowerPtrToInt(*PI);
+          } else if (const auto *PI = dyn_cast<PtrToAddrInst>(&I)) {
+            lowerPtrToAddr(*PI);
           } else if (const auto *SI = dyn_cast<SelectInst>(&I)) {
             lowerSelect(*SI);
           } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -5069,11 +5384,18 @@ class OS400MIEmitPass : public ModulePass {
           } else if (const auto *BI = dyn_cast<CondBrInst>(&I)) {
             lowerConditionalBranch(*BI);
             SawTerminator = true;
+          } else if (const auto *SI = dyn_cast<SwitchInst>(&I)) {
+            lowerSwitch(*SI);
+            SawTerminator = true;
           } else {
+            std::string InstructionText;
+            raw_string_ostream OS(InstructionText);
+            I.print(OS);
             fail("supported scalar alloca/getelementptr/store/load/add/sub/"
                  "and/or/icmp/zext/sext/trunc/ptrtoint/select/phi, "
-                 "extractvalue, insertvalue, memcpy, memset, va_arg, branch, "
-                 "and ret instructions");
+                 "freeze, extractvalue, insertvalue, memcpy, memset, va_arg, "
+                 "switch, branch, and ret instructions; unsupported "
+                 "instruction " + OS.str());
           }
         }
 
@@ -5084,12 +5406,19 @@ class OS400MIEmitPass : public ModulePass {
       for (const std::string &Line : EdgeBlocks)
         Body.push_back(Line);
 
-      addFrameMapRecord(FrameOffset, NextStackOffset - FrameOffset);
+      addFrameMapRecord(0, CurrentFunction->FrameSize);
     }
 
     ArrayRef<std::string> getDeclarations() const { return Declarations; }
     ArrayRef<std::string> getBody() const { return Body; }
     ArrayRef<MapRecord> getMapRecords() const { return MapRecords; }
+    uint32_t getArenaSize() const {
+      return std::max<uint32_t>(ArenaSize, alignTo(NextArenaOffset, 16));
+    }
+    uint32_t getStackSize() const {
+      return std::max(MinStackSize,
+                      static_cast<uint32_t>(alignTo(RequiredStackSize, 16)));
+    }
   };
 
   void emitProgram(const Module &M, const ArenaLayout &Layout,
@@ -5110,11 +5439,15 @@ class OS400MIEmitPass : public ModulePass {
     Lines.push_back("DCL     SPCPTR      ARGV       BAS(ARGV@);");
     Lines.push_back("DCL     DD          NBR_PARMS  BIN(2);");
     Lines.push_back("DCL     DD          MAIN_RC    BIN(4);");
+    Lines.push_back("DCL     DD          FRAME_BASE BIN(4);");
+    Lines.push_back("DCL     DD          STACK_TOP  BIN(4);");
+    uint32_t CombinedArenaSize =
+        std::max(Layout.getArenaSize(), Lowerer.getArenaSize());
     Lines.push_back("DCL     DD          C_MEM      CHAR(" +
-                    std::to_string(Layout.getArenaSize()) + ") BDRY(16);");
+                    std::to_string(CombinedArenaSize) + ") BDRY(16);");
     Lines.push_back("DCL     SPCPTR      .C_BASE    INIT(C_MEM);");
     Lines.push_back("DCL     DD          C_STACK    CHAR(" +
-                    std::to_string(StackSize) + ") BDRY(16);");
+                    std::to_string(Lowerer.getStackSize()) + ") BDRY(16);");
     Lines.push_back("DCL     SPCPTR      .S_BASE    INIT(C_STACK);");
     for (const std::string &Decl : Layout.getDeclarations())
       Lines.push_back(Decl);
@@ -5125,6 +5458,11 @@ class OS400MIEmitPass : public ModulePass {
     Lines.push_back("DCL     INSPTR      .MAIN;");
     Lines.push_back("ENTRY * (PARM_LIST) EXT;");
     Lines.push_back("        STPLLEN     NBR_PARMS;");
+    Lines.push_back("        CPYNV       FRAME_BASE,0;");
+    Lines.push_back("        CPYNV       STACK_TOP," +
+                    std::to_string(Plan.getInfo(Plan.getEntryFunction())
+                                       .FrameSize) +
+                    ";");
     Lines.push_back("        CALLI       MAIN, *, .MAIN;");
     Lines.push_back("        RTX         *;");
     for (const std::string &Line : Lowerer.getBody())
@@ -5232,10 +5570,13 @@ class OS400MIEmitPass : public ModulePass {
 
     emitMapRecord(MapOS,
                   makeFixedMapRecord("C_MEM", "arena", "reserved", "", {},
-                                     0, Layout.getArenaSize(), 16));
+                                     0,
+                                     std::max(Layout.getArenaSize(),
+                                              Lowerer.getArenaSize()),
+                                     16));
     emitMapRecord(MapOS,
                   makeFixedMapRecord("C_STACK", "stack", "reserved", "", {},
-                                     0, StackSize, 16));
+                                     0, Lowerer.getStackSize(), 16));
     emitMapRecord(MapOS, makeFixedMapRecord("MAIN_RC", "return_slot",
                                             "reserved", "", {}, std::nullopt,
                                             4, 4));

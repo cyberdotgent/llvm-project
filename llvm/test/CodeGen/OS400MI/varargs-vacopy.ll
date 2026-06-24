@@ -25,9 +25,12 @@ entry:
   ret i32 %call
 }
 
-; CHECK: DCL DD S{{[0-9]+}} CHAR(4) DEF(C_STACK) POS(5);
+; CHECK: DCL     DD          FRAME_BASE BIN(4);
+; CHECK: DCL     DD          STACK_TOP  BIN(4);
+; CHECK: ADDN        STACK_TOP,STACK_TOP,
 ; CHECK: CPYNV LS_I4,20;
-; CHECK: CPYNV LS_I4,536870916;
+; CHECK: ADDN        {{T[0-9]+}},FRAME_BASE,
+; CHECK: CPYNV LS_I4,{{T[0-9]+}};
 ; CHECK: CPYNV {{T[0-9]+}},LS_I4;
 ; CHECK: CPYNV LS_I4,{{T[0-9]+}};
 ; CHECK: CPYNV {{T[0-9]+}},LS_I4;

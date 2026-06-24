@@ -11,4 +11,4 @@ entry:
   ret i32 %r
 }
 
-; CHECK: OS400MI MVP only supports defined internal callees; external calls require CALLX ABI
+; CHECK: OS400MI MVP only supports a definition for external callee 'external_fn'; unresolved C calls require a bitcode runtime/library definition or explicit OS400MI CALLX builtins

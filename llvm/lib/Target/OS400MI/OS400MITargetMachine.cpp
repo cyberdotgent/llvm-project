@@ -1288,25 +1288,25 @@ class OS400MIEmitPass : public ModulePass {
                             ""});
     }
 
-    void createMainInfo(const Function &Main) {
+    void createEntryInfo(const Function &Entry) {
       FunctionInfo Info;
-      Info.F = &Main;
+      Info.F = &Entry;
       Info.EntryName = "MAIN";
       Info.ReturnPointerName = ".MAIN";
       Info.ReturnSlot =
-          makeSlot(Main.getParent()->getDataLayout(), Main.getReturnType(),
+          makeSlot(Entry.getParent()->getDataLayout(), Entry.getReturnType(),
                    "MAIN_RC");
-      Infos[&Main] = std::move(Info);
+      Infos[&Entry] = std::move(Info);
       MapRecords.push_back({"MAIN",
                             "function",
                             "function",
-                            "main",
+                            getOriginalName(Entry),
                             std::nullopt,
                             std::nullopt,
                             false,
                             NameAllocator::getMaxMINameLength(),
                             "",
-                            getSourceLocation(Main),
+                            getSourceLocation(Entry),
                             std::nullopt,
                             std::nullopt,
                             std::nullopt,
@@ -1342,11 +1342,11 @@ class OS400MIEmitPass : public ModulePass {
       createHelperInfo(F);
     }
 
-    void validateFunctionSignature(const Function &F, bool IsMain) const {
+    void validateFunctionSignature(const Function &F, bool IsEntry) const {
       FunctionType *Ty = F.getFunctionType();
-      if (IsMain) {
+      if (IsEntry) {
         if (!Ty->getReturnType()->isIntegerTy(32) || Ty->getNumParams() != 0)
-          fail("int main(void)");
+          fail("a defined i32(void) program entry function");
         return;
       }
 
@@ -1355,7 +1355,7 @@ class OS400MIEmitPass : public ModulePass {
              "i1/i8/i16/i32/i64/PTR32 arguments and returns");
     }
 
-    void visitFunction(const Function &F, bool IsMain) {
+    void visitFunction(const Function &F, bool IsEntry) {
       if (F.isDeclaration())
         fail("defined functions for direct internal calls");
       if (F.empty())
@@ -1368,7 +1368,7 @@ class OS400MIEmitPass : public ModulePass {
         return;
 
       State = 1;
-      validateFunctionSignature(F, IsMain);
+      validateFunctionSignature(F, IsEntry);
       ensureInfo(F);
       Functions.push_back(&F);
 
@@ -1396,7 +1396,9 @@ class OS400MIEmitPass : public ModulePass {
           if (isa<IntrinsicInst>(I))
             continue;
           if (Callee->isDeclaration())
-            fail("defined internal callees; external calls require CALLX ABI");
+            fail("a definition for external callee '" + Callee->getName() +
+                 "'; unresolved C calls require a bitcode runtime/library "
+                 "definition or explicit OS400MI CALLX builtins");
 
           validateFunctionSignature(*Callee, false);
           visitFunction(*Callee, false);
@@ -1410,22 +1412,24 @@ class OS400MIEmitPass : public ModulePass {
     explicit ModuleFunctionPlan(NameAllocator &Names) : Names(Names) {}
 
     void analyze(const Module &M) {
-      const Function *Main = M.getFunction("main");
-      if (!Main || Main->isDeclaration())
-        fail("a defined i32 main function");
+      const Function *Entry = M.getFunction("_start");
+      if (!Entry || Entry->isDeclaration())
+        Entry = M.getFunction("main");
+      if (!Entry || Entry->isDeclaration())
+        fail("a defined i32(void) _start or main function");
 
-      createMainInfo(*Main);
-      visitFunction(*Main, true);
+      createEntryInfo(*Entry);
+      visitFunction(*Entry, true);
 
-      for (const Function &F : M.functions()) {
-        if (!F.isDeclaration() && !VisitState.contains(&F))
-          fail("defined functions reachable from main");
-      }
+      // Whole-program hosted links can leave unused definitions from selected
+      // bitcode archive members.  Lower only the program slice reachable from
+      // the OS400MI entry function; unresolved or unsupported calls in that
+      // reachable slice are still diagnosed during visitFunction/lowering.
     }
 
-    const Function &getMainFunction() const {
+    const Function &getEntryFunction() const {
       if (Functions.empty())
-        fail("a defined i32 main function");
+        fail("a defined i32(void) _start or main function");
       return *Functions.front();
     }
 
@@ -4306,8 +4310,12 @@ class OS400MIEmitPass : public ModulePass {
         fail("supported LLVM intrinsics");
       }
 
-      if (!Callee || Callee->isDeclaration())
-        fail("defined internal callees; external calls require CALLX ABI");
+      if (!Callee)
+        fail("direct function calls");
+      if (Callee->isDeclaration())
+        fail("a definition for external callee '" + Callee->getName() +
+             "'; unresolved C calls require a bitcode runtime/library "
+             "definition or explicit OS400MI CALLX builtins");
 
       const FunctionInfo &CalleeInfo = FunctionPlan.getInfo(*Callee);
       if (!(CB.getType()->isIntegerTy(1) || CB.getType()->isIntegerTy(8) ||

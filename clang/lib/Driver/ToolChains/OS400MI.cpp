@@ -86,6 +86,46 @@ static std::optional<std::string> findOS400MIArchive(const ToolChain &TC,
   return std::nullopt;
 }
 
+static bool isOS400MIHostedLink(const ArgList &Args) {
+  return !Args.hasArg(clang::options::OPT_ffreestanding,
+                      clang::options::OPT_nostdlib);
+}
+
+static void addOS400MIStartFile(const ToolChain &TC, Compilation &C,
+                                const ArgList &Args,
+                                ArgStringList &LinkArgs) {
+  if (!isOS400MIHostedLink(Args) ||
+      Args.hasArg(clang::options::OPT_nostartfiles))
+    return;
+
+  std::string Crt0 = TC.GetFilePath("crt0.o");
+  if (!llvm::sys::fs::exists(Crt0)) {
+    C.getDriver().Diag(clang::diag::err_drv_no_such_file)
+        << Args.MakeArgString("crt0.o");
+    return;
+  }
+
+  LinkArgs.push_back(Args.MakeArgString(Crt0));
+}
+
+static void addOS400MIDefaultLibs(const ToolChain &TC, Compilation &C,
+                                  const ArgList &Args,
+                                  ArgStringList &LinkArgs) {
+  if (!isOS400MIHostedLink(Args) ||
+      Args.hasArg(clang::options::OPT_nodefaultlibs))
+    return;
+
+  for (llvm::StringRef Lib : {"c", "os400mi"}) {
+    if (std::optional<std::string> Archive =
+            findOS400MIArchive(TC, Args, Lib)) {
+      LinkArgs.push_back(Args.MakeArgString(*Archive));
+      continue;
+    }
+    C.getDriver().Diag(clang::diag::err_drv_no_such_file)
+        << Args.MakeArgString(getOS400MIArchiveName(Lib));
+  }
+}
+
 void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                    const InputInfo &Output,
                                    const InputInfoList &Inputs,
@@ -94,6 +134,8 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   assert(!Inputs.empty() && "Must have at least one input.");
 
   ArgStringList LinkArgs;
+  addOS400MIStartFile(getToolChain(), C, Args, LinkArgs);
+
   for (const InputInfo &Input : Inputs) {
     if (Input.isFilename()) {
       LinkArgs.push_back(Input.getFilename());
@@ -117,6 +159,8 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     }
   }
 
+  addOS400MIDefaultLibs(getToolChain(), C, Args, LinkArgs);
+
   if (LinkArgs.empty())
     return;
 
@@ -124,8 +168,14 @@ void os400mi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   const char *LinkedBC =
       C.getDriver().CreateTempFile(C, Stem + "-os400mi-link", "bc", false);
 
-  tools::constructLLVMLinkCommand(C, *this, JA, Inputs, LinkArgs, Output, Args,
-                                  LinkedBC);
+  ArgStringList LlvmLinkArgs({"-o", LinkedBC, "--only-needed"});
+  LlvmLinkArgs.append(LinkArgs);
+
+  const char *LlvmLink =
+      Args.MakeArgString(getToolChain().GetProgramPath("llvm-link"));
+  C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
+                                         LlvmLink, LlvmLinkArgs, Inputs,
+                                         Output));
 
   ArgStringList LlcArgs;
   LlcArgs.push_back(

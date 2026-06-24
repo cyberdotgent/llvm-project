@@ -17,7 +17,8 @@ entry:
 
 ; MI: DCL     DD          C_MEM      CHAR(256) BDRY(16);
 ; MI: DCL     DD          G000001    BIN(4)     DEF(C_MEM) POS(5) INIT(7);
-; MI: DCL     DD          L000001    CHAR(3)    DEF(C_MEM) POS(9) INIT(X'C88900');
+; MI: DCL     DD          L000001    CHAR(3)    DEF(C_MEM) POS(9)
+; MI-NEXT: INIT(X'C88900');
 ; MI: CPYNV       T000001,G000001;
 
 ; MAP: {"mi_name":"C_MEM","kind":"arena","name_class":"reserved","max_name_length":48,"collision":false,"arena_offset":0,"size":256,"alignment":16}

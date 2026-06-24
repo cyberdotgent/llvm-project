@@ -127,6 +127,7 @@ add_clang_library(clangCodeGen
   TargetBuiltins/DirectX.cpp
   TargetBuiltins/Hexagon.cpp
   TargetBuiltins/NVPTX.cpp
+  TargetBuiltins/OS400MI.cpp
   TargetBuiltins/PPC.cpp
   TargetBuiltins/RISCV.cpp
   TargetBuiltins/SPIR.cpp

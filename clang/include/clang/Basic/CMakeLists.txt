@@ -118,6 +118,10 @@ clang_tablegen(BuiltinsNVPTX.inc -gen-clang-builtins
   SOURCE BuiltinsNVPTX.td
   TARGET ClangBuiltinsNVPTX)
 
+clang_tablegen(BuiltinsOS400MI.inc -gen-clang-builtins
+  SOURCE BuiltinsOS400MI.td
+  TARGET ClangBuiltinsOS400MI)
+
 clang_tablegen(BuiltinsRISCV.inc -gen-clang-builtins
   SOURCE BuiltinsRISCV.td
   TARGET ClangBuiltinsRISCV)

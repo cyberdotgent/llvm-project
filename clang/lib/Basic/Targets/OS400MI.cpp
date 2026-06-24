@@ -8,9 +8,24 @@
 
 #include "OS400MI.h"
 #include "clang/Basic/MacroBuilder.h"
+#include "clang/Basic/TargetBuiltins.h"
 
 using namespace clang;
 using namespace clang::targets;
+
+static constexpr int NumBuiltins =
+    clang::OS400MI::LastTSBuiltin - Builtin::FirstTSBuiltin;
+
+#define GET_BUILTIN_STR_TABLE
+#include "clang/Basic/BuiltinsOS400MI.inc"
+#undef GET_BUILTIN_STR_TABLE
+
+static constexpr Builtin::Info BuiltinInfos[] = {
+#define GET_BUILTIN_INFOS
+#include "clang/Basic/BuiltinsOS400MI.inc"
+#undef GET_BUILTIN_INFOS
+};
+static_assert(std::size(BuiltinInfos) == NumBuiltins);
 
 void OS400MITargetInfo::getTargetDefines(const LangOptions &Opts,
                                          MacroBuilder &Builder) const {
@@ -18,4 +33,9 @@ void OS400MITargetInfo::getTargetDefines(const LangOptions &Opts,
   Builder.defineMacro("__os400mi__");
   Builder.defineMacro("__OS400__");
   Builder.defineMacro("__os400__");
+}
+
+llvm::SmallVector<Builtin::InfosShard>
+OS400MITargetInfo::getTargetBuiltins() const {
+  return {{&BuiltinStrings, BuiltinInfos}};
 }

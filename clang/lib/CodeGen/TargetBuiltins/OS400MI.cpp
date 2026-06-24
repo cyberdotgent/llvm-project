@@ -1,0 +1,73 @@
+//===--- OS400MI.cpp - Emit OS/400 MI builtins ----------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "CodeGenFunction.h"
+#include "clang/Basic/TargetBuiltins.h"
+#include "llvm/IR/Function.h"
+
+using namespace clang;
+using namespace CodeGen;
+
+static llvm::Value *emitOS400MICall(CodeGenFunction &CGF, llvm::StringRef Name,
+                                    llvm::Type *ReturnTy,
+                                    llvm::ArrayRef<llvm::Value *> Args) {
+  llvm::SmallVector<llvm::Type *, 4> ArgTys;
+  for (llvm::Value *Arg : Args)
+    ArgTys.push_back(Arg->getType());
+
+  llvm::FunctionType *FnTy =
+      llvm::FunctionType::get(ReturnTy, ArgTys, /*isVarArg=*/false);
+  llvm::FunctionCallee Callee = CGF.CGM.CreateRuntimeFunction(FnTy, Name);
+  return CGF.Builder.CreateCall(Callee, Args);
+}
+
+llvm::Value *CodeGenFunction::EmitOS400MIBuiltinExpr(unsigned BuiltinID,
+                                                     const CallExpr *E) {
+  llvm::Type *RetVoidTy = VoidTy;
+  llvm::Type *PtrTy = Int8PtrTy;
+  llvm::Type *I16Ty = Int16Ty;
+
+  llvm::SmallVector<llvm::Value *, 4> Args;
+  for (const Expr *Arg : E->arguments())
+    Args.push_back(EmitScalarExpr(Arg));
+
+  switch (BuiltinID) {
+  case OS400MI::BI__builtin_os400mi_ufcb_qsysprt:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.qsysprt", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb_outbuf:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.outbuf", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_ufcb_odp:
+    return emitOS400MICall(*this, "llvm.os400mi.ufcb.odp", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_odp_dcb_put:
+    return emitOS400MICall(*this, "llvm.os400mi.odp.dcb.put", I16Ty, Args);
+  case OS400MI::BI__builtin_os400mi_sysptr_sept:
+    return emitOS400MICall(*this, "llvm.os400mi.sysptr.sept", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_spcptr_null:
+    return emitOS400MICall(*this, "llvm.os400mi.spcptr.null", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_spcptr_add:
+    return emitOS400MICall(*this, "llvm.os400mi.spcptr.add", PtrTy, Args);
+  case OS400MI::BI__builtin_os400mi_dm_put_wait_option:
+    return emitOS400MICall(*this, "llvm.os400mi.dm.put.wait.option", PtrTy,
+                           Args);
+  case OS400MI::BI__builtin_os400mi_char_fill:
+    return emitOS400MICall(*this, "llvm.os400mi.char.fill", RetVoidTy, Args);
+  case OS400MI::BI__builtin_os400mi_char_from_cstr:
+    return emitOS400MICall(*this, "llvm.os400mi.char.from.cstr", RetVoidTy,
+                           Args);
+  case OS400MI::BI__builtin_os400mi_callx0:
+    return emitOS400MICall(*this, "llvm.os400mi.callx.0", RetVoidTy, Args);
+  case OS400MI::BI__builtin_os400mi_callx1:
+    return emitOS400MICall(*this, "llvm.os400mi.callx.1", RetVoidTy, Args);
+  case OS400MI::BI__builtin_os400mi_callx2:
+    return emitOS400MICall(*this, "llvm.os400mi.callx.2", RetVoidTy, Args);
+  case OS400MI::BI__builtin_os400mi_callx3:
+    return emitOS400MICall(*this, "llvm.os400mi.callx.3", RetVoidTy, Args);
+  default:
+    llvm_unreachable("unexpected OS400MI builtin");
+  }
+}

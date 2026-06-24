@@ -455,6 +455,10 @@ class OS400MIEmitPass : public ModulePass {
     return IsEqual;
   }
 
+  static bool isOS400MIPseudoCall(const Function *F) {
+    return F && F->isDeclaration() && F->getName().starts_with("llvm.os400mi.");
+  }
+
   struct CompareValue {
     CmpInst::Predicate Predicate;
     std::string LHS;
@@ -977,8 +981,8 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          " + Name.Name + "    CHAR(" +
                              std::to_string(Size) +
                              ")    DEF(C_MEM) POS(" +
-                             std::to_string(Offset + 1) + ") INIT(X'" + Hex +
-                             "');");
+                             std::to_string(Offset + 1) + ")");
+      Declarations.push_back("                          INIT(X'" + Hex + "');");
       addGlobalObject(GV, Name, "string", Offset, Size, 1, AccessWidth::I8,
                       false);
       addMapRecord(Name, "string", std::move(Original), Offset, Size, 1,
@@ -1305,7 +1309,8 @@ class OS400MIEmitPass : public ModulePass {
           const Function *Callee = CB->getCalledFunction();
           if (!Callee)
             fail("direct function calls");
-          if (getAggregateComparePseudoKind(Callee))
+          if (getAggregateComparePseudoKind(Callee) ||
+              isOS400MIPseudoCall(Callee))
             continue;
           if (isa<IntrinsicInst>(I))
             continue;
@@ -1365,6 +1370,7 @@ class OS400MIEmitPass : public ModulePass {
     DenseMap<const Value *, std::string> Values;
     DenseMap<const Value *, I64Value> I64Values;
     DenseMap<const Value *, ArenaSlot> AggregateValues;
+    DenseMap<const Value *, std::string> NativePtrValues;
     DenseMap<const Value *, std::string> SignedNarrowValues;
     DenseMap<const Value *, CompareValue> Comparisons;
     DenseMap<const Value *, I64CompareValue> I64Comparisons;
@@ -1379,6 +1385,10 @@ class OS400MIEmitPass : public ModulePass {
     uint32_t NextCallBarrier = 1;
     bool HasLoadStoreLens = false;
     bool HasU1Box = false;
+    bool HasNativeByteLens = false;
+    bool HasNativeSept = false;
+    bool HasNativeNull = false;
+    bool HasNativeQsysprt = false;
 
     static bool isI32(Type *Ty) { return Ty && Ty->isIntegerTy(32); }
     static bool isPTR32(Type *Ty) { return Ty && Ty->isPointerTy(); }
@@ -1603,6 +1613,89 @@ class OS400MIEmitPass : public ModulePass {
       Declarations.push_back("DCL     DD          U1_BYTE   CHAR(1)    DEF(U1_BOX) POS(4);");
     }
 
+    void ensureNativeByteLens() {
+      if (HasNativeByteLens)
+        return;
+
+      HasNativeByteLens = true;
+      Declarations.push_back("DCL     SPCPTR      .NCHAR;");
+      Declarations.push_back("DCL     DD          NCHAR     CHAR(1)    BAS(.NCHAR);");
+    }
+
+    void ensureNativeSept() {
+      if (HasNativeSept)
+        return;
+
+      HasNativeSept = true;
+      Declarations.push_back("DCL     SPCPTR      @SEPT     BASPCO;");
+      Declarations.push_back("DCL     SPCPTR      .SEPT(6440) BAS(@SEPT);");
+    }
+
+    void ensureNativeNull() {
+      if (HasNativeNull)
+        return;
+
+      HasNativeNull = true;
+      Declarations.push_back("DCL     SPCPTR      .NULL;");
+    }
+
+    void ensureNativeQsysprt() {
+      if (HasNativeQsysprt)
+        return;
+
+      HasNativeQsysprt = true;
+      ensureNativeNull();
+      Declarations.push_back("DCL     SPCPTR      .ODP;");
+      Declarations.push_back("DCL     SPC         ODP       BAS(.ODP);");
+      Declarations.push_back("DCL     DD          ODP-STATUS    CHAR(4) DIR;");
+      Declarations.push_back("DCL     DD          ODP-DEV-LEN   BIN(4)  DIR;");
+      Declarations.push_back("DCL     DD          ODP-OPEN-SZ   BIN(4)  DIR;");
+      Declarations.push_back("DCL     DD          ODP-OPEN-FB   BIN(4)  DIR;");
+      Declarations.push_back("DCL     DD          ODP-DCB       BIN(4)  DIR;");
+      Declarations.push_back("DCL     SPCPTR      .DCB;");
+      Declarations.push_back("DCL     SPC         DCB       BAS(.DCB);");
+      Declarations.push_back("DCL     DD          DCB-MAX-DEV   BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-NBR-DEV   BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-DEV-NAME  CHAR(10) DIR;");
+      Declarations.push_back("DCL     DD          DCB-FM-OFF    BIN(4)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-FM-LEN    BIN(4)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-LUD-IDX   BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-GET       BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-GET-RRN   BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-GET-KEY   BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          *             BIN(2)  DIR;");
+      Declarations.push_back("DCL     DD          DCB-PUT       BIN(2)  DIR;");
+      Declarations.push_back("DCL     SPCPTR      .OFCB     INIT(OFCB);");
+      Declarations.push_back("DCL     DD          OFCB      CHAR(214) BDRY(16);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-ODP    DEF(OFCB) POS(1);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-INBUF  DEF(OFCB) POS(17);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-OUTBUF DEF(OFCB) POS(33);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-OPENFB DEF(OFCB) POS(49);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-IOFB   DEF(OFCB) POS(65);");
+      Declarations.push_back("DCL     SPCPTR      .OFCB-NEXT   DEF(OFCB) POS(81);");
+      Declarations.push_back("DCL     DD          *            CHAR(32) DEF(OFCB) POS(97);");
+      Declarations.push_back("DCL     DD          OFCB-FILE    CHAR(10) DEF(OFCB) POS(129) INIT(\"QSYSPRT\");");
+      Declarations.push_back("DCL     DD          OFCB-LIB-ID  BIN(2) DEF(OFCB) POS(139) INIT(-75);");
+      Declarations.push_back("DCL     DD          OFCB-LIBRARY CHAR(10) DEF(OFCB) POS(141) INIT(\"*LIBL\");");
+      Declarations.push_back("DCL     DD          OFCB-MBR-ID  BIN(2) DEF(OFCB) POS(151) INIT(-71);");
+      Declarations.push_back("DCL     DD          OFCB-MEMBER  CHAR(10) DEF(OFCB) POS(153) INIT(\"*FIRST\");");
+      Declarations.push_back("DCL     DD          OFCB-DEV-NAME CHAR(10) DEF(OFCB) POS(163);");
+      Declarations.push_back("DCL     DD          OFCB-DEV-IDX BIN(2) DEF(OFCB) POS(173);");
+      Declarations.push_back("DCL     DD          OFCB-FLAGS-1 CHAR(1) DEF(OFCB) POS(175) INIT(X'80');");
+      Declarations.push_back("DCL     DD          OFCB-FLAGS-2 CHAR(1) DEF(OFCB) POS(176) INIT(X'10');");
+      Declarations.push_back("DCL     DD          OFCB-REL     CHAR(4) DEF(OFCB) POS(177);");
+      Declarations.push_back("DCL     DD          OFCB-IMC     BIN(4) DEF(OFCB) POS(181);");
+      Declarations.push_back("DCL     DD          OFCB-MORE    CHAR(1) DEF(OFCB) POS(185);");
+      Declarations.push_back("DCL     DD          *            CHAR(23) DEF(OFCB) POS(186);");
+      Declarations.push_back("DCL     DD          OFCB-LEN-ID  BIN(2) DEF(OFCB) POS(209) INIT(1);");
+      Declarations.push_back("DCL     DD          OFCB-RCD-LEN BIN(2) DEF(OFCB) POS(211) INIT(132);");
+      Declarations.push_back("DCL     DD          OFCB-END     BIN(2) DEF(OFCB) POS(213) INIT(32767);");
+      Declarations.push_back("DCL     DD          OUTBUF    CHAR(132) BAS(.OFCB-OUTBUF);");
+      Declarations.push_back("DCL     DD          PUT-ENTRY BIN(2);");
+      Declarations.push_back("DCL     DD          PUTOPT    BIN(4) INIT(H'00000005');");
+      Declarations.push_back("DCL     SPCPTR      .PUTOPT   INIT(PUTOPT);");
+    }
+
     static StringRef getBranchPredicate(CmpInst::Predicate Predicate) {
       switch (Predicate) {
       case CmpInst::ICMP_EQ:
@@ -1698,6 +1791,16 @@ class OS400MIEmitPass : public ModulePass {
                              "B   CHAR(4)    DEF(" + Name.Name + ") POS(1);");
       addMapRecord(Name, Kind.str(), "", std::nullopt, std::nullopt, 4, 4);
       return Name.Name;
+    }
+
+    std::string createAnonymousNativePtr(StringRef Kind) {
+      GeneratedName Name = Names.createTempName();
+      std::string NativeName = "." + Name.Name;
+      Declarations.push_back("DCL     SPCPTR      " + NativeName + ";");
+      addMapRecord({NativeName, Name.Class, Name.Ordinal, Name.CollisionOrdinal,
+                    Name.Collision, Name.Hash},
+                   Kind.str(), "", std::nullopt, std::nullopt, 16, 16);
+      return NativeName;
     }
 
     I64Value createI64Temp(const Value &V, StringRef Kind = "i64_temp") {
@@ -2752,6 +2855,19 @@ class OS400MIEmitPass : public ModulePass {
       llvm_unreachable("fail should not return");
     }
 
+    std::string getNativePtrName(const Value *V) {
+      if (isa<ConstantPointerNull>(V)) {
+        ensureNativeNull();
+        Body.push_back("        CPYBWP      .NULL,*;");
+        return ".NULL";
+      }
+
+      auto It = NativePtrValues.find(V);
+      if (It == NativePtrValues.end())
+        fail("native MI pointer operands from OS400MI builtins");
+      return It->second;
+    }
+
     std::string addStaticOffset(const Twine &Kind, StringRef Base,
                                 uint64_t Offset) {
       if (Offset == 0)
@@ -2940,6 +3056,202 @@ class OS400MIEmitPass : public ModulePass {
       Hex.push_back(Digits[Byte >> 4]);
       Hex.push_back(Digits[Byte & 0x0F]);
       return Hex;
+    }
+
+    void emitNativeCharFill(const Value *DestPtr, const Value *Length,
+                            const Value *Byte) {
+      std::string Dest = getNativePtrName(DestPtr);
+      std::optional<uint64_t> ConstantLength = getConstantLength(Length);
+      if (!ConstantLength)
+        fail("constant lengths for native MI char fill");
+
+      uint32_t ByteValue = 0;
+      if (const auto *CI = dyn_cast<ConstantInt>(Byte))
+        ByteValue = CI->getZExtValue() & 0xFF;
+      else
+        fail("constant byte values for native MI char fill");
+
+      if (Dest == ".OFCB-OUTBUF" && *ConstantLength == 132 &&
+          ByteValue == 0x20) {
+        Body.push_back("        CPYBREP     OUTBUF,\" \";");
+        return;
+      }
+
+      ensureNativeByteLens();
+      std::string ByteHex = getByteHex(ByteValue);
+      for (uint64_t I = 0; I != *ConstantLength; ++I) {
+        Body.push_back("        ADDSPP      .NCHAR," + Dest + "," +
+                       std::to_string(I) + ";");
+        Body.push_back("        CPYBLA      NCHAR,X'" + ByteHex + "';");
+      }
+    }
+
+    void emitNativeCharFromCstr(const Value *DestPtr, const Value *Length,
+                                const Value *SourcePtr) {
+      ensureLoadStoreLens();
+      ensureNativeByteLens();
+      std::string Dest = getNativePtrName(DestPtr);
+      std::string Source = createAnonymousTemp("native_cstr_source");
+      std::string Count = createAnonymousTemp("native_cstr_count");
+      std::string Index = createAnonymousTemp("native_cstr_index");
+      GeneratedName LoopName = Names.createBlockName();
+      GeneratedName DoneName = Names.createBlockName();
+      std::string Loop = LoopName.Name;
+      std::string Done = DoneName.Name;
+      addMapRecord(LoopName, "native_cstr_loop", "", std::nullopt);
+      addMapRecord(DoneName, "native_cstr_done", "", std::nullopt);
+
+      Body.push_back("        CPYNV       " + Source + "," +
+                     getPointerOffsetName(SourcePtr) + ";");
+      Body.push_back("        CPYNV       " + Count + "," +
+                     getMemoryLengthName(Length) + ";");
+      Body.push_back("        CPYNV       " + Index + ",0;");
+      Body.push_back(Loop + ":");
+      Body.push_back("        CMPNV(B)    " + Count + ",0/EQ(" + Done + ");");
+      Body.push_back("        CPYNV       OFF," + Source + ";");
+      Body.push_back("        ADDSPP      .LS,.C_BASE,OFF;");
+      Body.push_back("        CMPBLA(B)   LS_I1,X'00'/EQ(" + Done + ");");
+      Body.push_back("        ADDSPP      .NCHAR," + Dest + "," + Index + ";");
+      Body.push_back("        CPYBLA      NCHAR,LS_I1;");
+      Body.push_back("        ADDN        " + Source + "," + Source + ",1;");
+      Body.push_back("        ADDN        " + Index + "," + Index + ",1;");
+      Body.push_back("        SUBN        " + Count + "," + Count + ",1;");
+      Body.push_back("        B           " + Loop + ";");
+      Body.push_back(Done + ":");
+    }
+
+    void emitNativeCallx(const CallBase &CB, unsigned Arity) {
+      if (CB.arg_size() != Arity + 1)
+        fail("OS400MI callx arity matching its builtin name");
+
+      std::string Callee = getNativePtrName(CB.getArgOperand(0));
+      if (Arity == 0) {
+        Body.push_back("        CALLX       " + Callee + ",*,*;");
+        return;
+      }
+
+      GeneratedName OLName = Names.createTempName();
+      std::string Decl = "DCL     OL          " + OLName.Name + "(";
+      for (unsigned I = 0; I != Arity; ++I) {
+        if (I != 0)
+          Decl += ",";
+        Decl += getNativePtrName(CB.getArgOperand(I + 1));
+      }
+      Decl += ")";
+      if (Arity == 1)
+        Decl += " ARG";
+      Decl += ";";
+      Declarations.push_back(std::move(Decl));
+      addMapRecord(OLName, "native_callx_operand_list", "", std::nullopt);
+      Body.push_back("        CALLX       " + Callee + "," + OLName.Name +
+                     ",*;");
+    }
+
+    bool lowerOS400MIPseudoCall(const CallBase &CB, const Function &Callee) {
+      StringRef Name = Callee.getName();
+      if (!Name.starts_with("llvm.os400mi."))
+        return false;
+
+      if (Name == "llvm.os400mi.ufcb.qsysprt") {
+        if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_qsysprt builtin signature");
+        ensureNativeQsysprt();
+        NativePtrValues[&CB] = ".OFCB";
+        return true;
+      }
+      if (Name == "llvm.os400mi.ufcb.outbuf") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_outbuf builtin signature");
+        ensureNativeQsysprt();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        NativePtrValues[&CB] = ".OFCB-OUTBUF";
+        return true;
+      }
+      if (Name == "llvm.os400mi.ufcb.odp") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI ufcb_odp builtin signature");
+        ensureNativeQsysprt();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        Body.push_back("        CPYBWP      .ODP,.OFCB-ODP;");
+        NativePtrValues[&CB] = ".ODP";
+        return true;
+      }
+      if (Name == "llvm.os400mi.odp.dcb.put") {
+        if (CB.arg_size() != 1 || !CB.getType()->isIntegerTy(16))
+          fail("OS400MI odp_dcb_put builtin signature");
+        ensureNativeQsysprt();
+        (void)getNativePtrName(CB.getArgOperand(0));
+        Body.push_back("        ADDSPP      .DCB,.ODP,ODP-DCB;");
+        Body.push_back("        CPYNV       PUT-ENTRY,DCB-PUT;");
+        Values[&CB] = "PUT-ENTRY";
+        return true;
+      }
+      if (Name == "llvm.os400mi.sysptr.sept") {
+        if (CB.arg_size() != 1 || !CB.getType()->isPointerTy())
+          fail("OS400MI sysptr_sept builtin signature");
+        ensureNativeSept();
+        NativePtrValues[&CB] =
+            ".SEPT(" + getOperandName(CB.getArgOperand(0)) + ")";
+        return true;
+      }
+      if (Name == "llvm.os400mi.spcptr.null") {
+        if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
+          fail("OS400MI spcptr_null builtin signature");
+        ensureNativeNull();
+        Body.push_back("        CPYBWP      .NULL,*;");
+        NativePtrValues[&CB] = ".NULL";
+        return true;
+      }
+      if (Name == "llvm.os400mi.spcptr.add") {
+        if (CB.arg_size() != 2 || !CB.getType()->isPointerTy())
+          fail("OS400MI spcptr_add builtin signature");
+        std::string Dest = createAnonymousNativePtr("native_spcptr_add");
+        Body.push_back("        ADDSPP      " + Dest + "," +
+                       getNativePtrName(CB.getArgOperand(0)) + "," +
+                       getOperandName(CB.getArgOperand(1)) + ";");
+        NativePtrValues[&CB] = Dest;
+        return true;
+      }
+      if (Name == "llvm.os400mi.dm.put.wait.option") {
+        if (CB.arg_size() != 0 || !CB.getType()->isPointerTy())
+          fail("OS400MI dm_put_wait_option builtin signature");
+        ensureNativeQsysprt();
+        NativePtrValues[&CB] = ".PUTOPT";
+        return true;
+      }
+      if (Name == "llvm.os400mi.char.fill") {
+        if (CB.arg_size() != 3 || !CB.getType()->isVoidTy())
+          fail("OS400MI char_fill builtin signature");
+        emitNativeCharFill(CB.getArgOperand(0), CB.getArgOperand(1),
+                           CB.getArgOperand(2));
+        return true;
+      }
+      if (Name == "llvm.os400mi.char.from.cstr") {
+        if (CB.arg_size() != 3 || !CB.getType()->isVoidTy())
+          fail("OS400MI char_from_cstr builtin signature");
+        emitNativeCharFromCstr(CB.getArgOperand(0), CB.getArgOperand(1),
+                               CB.getArgOperand(2));
+        return true;
+      }
+      if (Name == "llvm.os400mi.callx.0") {
+        emitNativeCallx(CB, 0);
+        return true;
+      }
+      if (Name == "llvm.os400mi.callx.1") {
+        emitNativeCallx(CB, 1);
+        return true;
+      }
+      if (Name == "llvm.os400mi.callx.2") {
+        emitNativeCallx(CB, 2);
+        return true;
+      }
+      if (Name == "llvm.os400mi.callx.3") {
+        emitNativeCallx(CB, 3);
+        return true;
+      }
+
+      fail("known OS400MI pseudo call");
+      llvm_unreachable("fail should not return");
     }
 
     std::optional<SmallVector<uint8_t, 32>>
@@ -3552,6 +3864,8 @@ class OS400MIEmitPass : public ModulePass {
         lowerAggregateCompareCall(CB, *IsAggregateCompare);
         return;
       }
+      if (Callee && lowerOS400MIPseudoCall(CB, *Callee))
+        return;
 
       if (isa<IntrinsicInst>(CB))
         fail("supported LLVM intrinsics");
@@ -3691,6 +4005,7 @@ class OS400MIEmitPass : public ModulePass {
       Values.clear();
       I64Values.clear();
       AggregateValues.clear();
+      NativePtrValues.clear();
       SignedNarrowValues.clear();
       Comparisons.clear();
       I64Comparisons.clear();

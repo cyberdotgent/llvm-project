@@ -16,12 +16,12 @@ entry:
 }
 
 ; CHECK: DCL     DD          S000001    CHAR(8)    DEF(C_STACK) POS(5);
-; CHECK:         ADDN        T000001,1,2;
-; CHECK:         ADDN        T000002,T000001,536870916;
-; CHECK:         ADDN        T000003,T000002,2;
-; CHECK:         CPYNV       OFF,T000003;
+; CHECK:         ADDN        [[IDX:T[0-9]+]],1,2;
+; CHECK:         ADDN        [[P:T[0-9]+]],[[IDX]],536870916;
+; CHECK:         ADDN        [[Q:T[0-9]+]],[[P]],2;
+; CHECK:         CPYNV       OFF,[[Q]];
 ; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
 ; CHECK:              CPYBLA      LS_I1,X'7F';
-; CHECK:         CPYNV       OFF,T000003;
+; CHECK:         CPYNV       OFF,[[Q]];
 ; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
 ; CHECK:              CPYBLA      U1_BOX,X'00000000';

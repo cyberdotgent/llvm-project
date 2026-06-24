@@ -663,6 +663,12 @@ class OS400MIEmitPass : public ModulePass {
     return F && F->isDeclaration() && F->getName().starts_with("llvm.os400mi.");
   }
 
+  static bool isSpecialLLVMGlobal(const GlobalVariable &GV) {
+    StringRef Name = GV.getName();
+    return Name == "llvm.compiler.used" || Name == "llvm.used" ||
+           Name == "llvm.global_ctors" || Name == "llvm.global_dtors";
+  }
+
   struct CompareValue {
     CmpInst::Predicate Predicate;
     std::string LHS;
@@ -976,8 +982,6 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Size = getAccessWidthBytes(Width);
       uint32_t Alignment = Width == AccessWidth::I8 ? 1 : std::min(Size, 4U);
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
@@ -1027,8 +1031,6 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Size = 4;
       uint32_t Alignment = 4;
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createGlobalName(Original);
@@ -1051,8 +1053,6 @@ class OS400MIEmitPass : public ModulePass {
       StringRef Bytes = CDA.getAsString();
       uint32_t Size = Bytes.size();
       uint32_t Offset = alignTo(NextArenaOffset, 1);
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
 
       std::string Original = getOriginalName(GV);
       GeneratedName Name = Names.createLiteralName(Original);
@@ -1080,8 +1080,6 @@ class OS400MIEmitPass : public ModulePass {
       uint32_t Size = static_cast<uint32_t>(DL.getTypeAllocSize(ValueTy));
       uint32_t Alignment = getABIAlignment(DL, ValueTy);
       uint32_t Offset = alignTo(NextArenaOffset, Alignment);
-      if (Offset + Size > ArenaSize)
-        fail("phase-1 arena storage within 256 bytes");
 
       SmallVector<uint8_t, 32> Bytes(Size, 0);
       writeArenaConstantBytes(GV.getInitializer(), Bytes);
@@ -1107,6 +1105,9 @@ class OS400MIEmitPass : public ModulePass {
 
     void lower(const Module &M) {
       for (const GlobalVariable &GV : M.globals()) {
+        if (isSpecialLLVMGlobal(GV))
+          continue;
+
         if (GV.isDeclaration())
           fail("defined globals only");
 
@@ -1626,8 +1627,13 @@ class OS400MIEmitPass : public ModulePass {
       }
 
       auto It = Values.find(V);
-      if (It == Values.end())
-        fail("operands defined by previous supported i32 instructions");
+      if (It == Values.end()) {
+        std::string ValueText;
+        raw_string_ostream OS(ValueText);
+        V->print(OS);
+        fail("operands defined by previous supported i32 instructions; "
+             "unsupported value " + OS.str());
+      }
       return It->second;
     }
 
@@ -3071,8 +3077,11 @@ class OS400MIEmitPass : public ModulePass {
     std::string getPointerOffsetName(const Value *V) const {
       if (std::optional<std::string> Offset = tryGetPointerOffsetName(V))
         return *Offset;
-      fail("region-tagged PTR32 values from allocas, globals, or "
-           "getelementptr");
+      std::string ValueText;
+      raw_string_ostream OS(ValueText);
+      V->printAsOperand(OS, false);
+      fail("region-tagged PTR32 values from allocas, globals, getelementptr, "
+           "loads, or phi nodes; unsupported value " + OS.str());
       llvm_unreachable("fail should not return");
     }
 
@@ -3117,11 +3126,16 @@ class OS400MIEmitPass : public ModulePass {
       if (!BaseOffset)
         fail("getelementptr from arena allocas, globals, or pointer offsets");
 
+      auto ValueIt = Values.find(&GEP);
+      std::string Dest =
+          ValueIt != Values.end() ? ValueIt->second : createTemp(GEP);
+      Values[&GEP] = Dest;
+
       APInt ConstantOffset(DL.getIndexSizeInBits(0), 0);
       if (GEP.accumulateConstantOffset(DL, ConstantOffset)) {
-        Values[&GEP] =
-            addStaticOffset("ptr_offset", *BaseOffset,
-                            ConstantOffset.getZExtValue());
+        Body.push_back("        ADDN        " + Dest + "," + *BaseOffset +
+                       "," + std::to_string(ConstantOffset.getZExtValue()) +
+                       ";");
         return;
       }
 
@@ -3175,17 +3189,16 @@ class OS400MIEmitPass : public ModulePass {
       uint64_t BaseValue = 0;
       if (!StringRef(*BaseOffset).getAsInteger(10, BaseValue) &&
           BaseValue == 0) {
-        Values[&GEP] = Offset;
+        Body.push_back("        CPYNV       " + Dest + "," + Offset + ";");
         return;
       }
 
       uint64_t OffsetValue = 0;
       if (!StringRef(Offset).getAsInteger(10, OffsetValue) && OffsetValue == 0) {
-        Values[&GEP] = *BaseOffset;
+        Body.push_back("        CPYNV       " + Dest + "," + *BaseOffset + ";");
         return;
       }
 
-      std::string Dest = createTemp(GEP);
       if (!StringRef(*BaseOffset).getAsInteger(10, BaseValue))
         Body.push_back("        ADDN        " + Dest + "," + Offset + "," +
                        *BaseOffset + ";");
@@ -4359,6 +4372,19 @@ class OS400MIEmitPass : public ModulePass {
       Values[&TI] = Dest;
     }
 
+    void lowerPtrToInt(const PtrToIntInst &PI) {
+      if (!PI.getOperand(0)->getType()->isPointerTy() ||
+          !PI.getType()->isIntegerTy(32))
+        fail("ptrtoint from PTR32 to i32");
+
+      auto ValueIt = Values.find(&PI);
+      std::string Dest =
+          ValueIt != Values.end() ? ValueIt->second : createTemp(PI);
+      Values[&PI] = Dest;
+      Body.push_back("        CPYNV       " + Dest + "," +
+                     getOperandName(PI.getOperand(0)) + ";");
+    }
+
     void lowerSelect(const SelectInst &SI) {
       if (SI.getType()->isIntegerTy(64)) {
         I64Value Dest = createI64Temp(SI);
@@ -4630,6 +4656,12 @@ class OS400MIEmitPass : public ModulePass {
           else
             Values[&PN] = createTemp(PN);
         }
+        for (const Instruction &I : BB) {
+          if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+            Values[GEP] = createTemp(*GEP);
+          else if (const auto *PI = dyn_cast<PtrToIntInst>(&I))
+            Values[PI] = createTemp(*PI);
+        }
       }
 
       for (const BasicBlock &BB : F) {
@@ -4656,6 +4688,8 @@ class OS400MIEmitPass : public ModulePass {
             lowerSExt(*SI);
           } else if (const auto *TI = dyn_cast<TruncInst>(&I)) {
             lowerTrunc(*TI);
+          } else if (const auto *PI = dyn_cast<PtrToIntInst>(&I)) {
+            lowerPtrToInt(*PI);
           } else if (const auto *SI = dyn_cast<SelectInst>(&I)) {
             lowerSelect(*SI);
           } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -4682,9 +4716,10 @@ class OS400MIEmitPass : public ModulePass {
             lowerConditionalBranch(*BI);
             SawTerminator = true;
           } else {
-            fail("supported scalar alloca/getelementptr/store/load/add/sub/icmp/zext/sext/select/"
-                 "phi, extractvalue, insertvalue, memcpy, memset, branch, and "
-                 "ret instructions");
+            fail("supported scalar alloca/getelementptr/store/load/add/sub/"
+                 "and/or/icmp/zext/sext/trunc/ptrtoint/select/phi, "
+                 "extractvalue, insertvalue, memcpy, memset, branch, and ret "
+                 "instructions");
           }
         }
 

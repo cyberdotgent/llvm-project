@@ -36,21 +36,22 @@ done:
 ; CHECK: B000001:
 ; CHECK-NEXT:         B           B000005;
 ; CHECK: B000002:
-; CHECK-NEXT:         ADDN        T000002,T000001,T000001;
-; CHECK-NEXT:         ADDN        T000003,T000002,T000002;
-; CHECK-NEXT:         ADDN        T000004,T000003,536870916;
-; CHECK-NEXT:         CPYNV       OFF,T000004;
+; CHECK-NEXT:         ADDN        [[TWICE:T[0-9]+]],T000001,T000001;
+; CHECK-NEXT:         ADDN        [[QUAD:T[0-9]+]],[[TWICE]],[[TWICE]];
+; CHECK-NEXT:         ADDN        [[P:T[0-9]+]],[[QUAD]],536870916;
+; CHECK-NEXT:         CPYNV       OFF,[[P]];
 ; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
 ; CHECK:              CPYNV       LS_I4,T000001;
-; CHECK:         CMPNV(B)    T000005,3/LO(B000003);
+; CHECK:         CMPNV(B)    {{T[0-9]+}},3/LO(B000003);
 ; CHECK-NEXT:         B           B000004;
 ; CHECK: B000004:
-; CHECK-NEXT:         CPYNV       OFF,536870924;
+; CHECK-NEXT:         ADDN        [[Q:T[0-9]+]],536870916,8;
+; CHECK-NEXT:         CPYNV       OFF,[[Q]];
 ; CHECK:              ADDSPP      .LS,.S_BASE,OFF;
-; CHECK:              CPYNV       T000006,LS_I4;
+; CHECK:              CPYNV       {{T[0-9]+}},LS_I4;
 ; CHECK: B000005:
 ; CHECK-NEXT:         CPYNV       T000001,0;
 ; CHECK-NEXT:         B           B000002;
 ; CHECK: B000009:
-; CHECK-NEXT:         CPYNV       T000001,T000005;
+; CHECK-NEXT:         CPYNV       T000001,{{T[0-9]+}};
 ; CHECK-NEXT:         B           B000002;

@@ -111,6 +111,13 @@
 // CHECK-NOVSX: "-target-feature" "-vsx"
 
 // RUN: %clang -target powerpc64-unknown-linux-gnu %s -mno-vsx -mvsx -### -o %t.o 2>&1 | FileCheck -check-prefix=CHECK-VSX %s
+
+// Check that -mppcas enables the PowerPC AS MC feature and that the last
+// option wins.
+// RUN: %clang -target powerpc64-unknown-linux-gnu %s -mno-ppcas -mppcas -### -c 2>&1 | FileCheck -check-prefix=PPCAS %s
+// RUN: %clang -target powerpc64-unknown-linux-gnu %s -mppcas -mno-ppcas -### -c 2>&1 | FileCheck -check-prefix=NO-PPCAS %s
+// PPCAS: "-target-feature" "+ppcas"
+// NO-PPCAS: "-target-feature" "-ppcas"
 // CHECK-VSX: "-target-feature" "+vsx"
 
 // RUN: %clang -target powerpc64-unknown-linux-gnu %s -mno-htm -### -o %t.o 2>&1 | FileCheck -check-prefix=CHECK-NOHTM %s

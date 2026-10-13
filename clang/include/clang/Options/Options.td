@@ -6145,6 +6145,9 @@ let Flags = [TargetSpecific] in {
 def maltivec : Flag<["-"], "maltivec">, Group<m_ppc_Features_Group>,
   HelpText<"Enable AltiVec vector initializer syntax">;
 def mno_altivec : Flag<["-"], "mno-altivec">, Group<m_ppc_Features_Group>;
+def mppcas : Flag<["-"], "mppcas">, Group<m_ppc_Features_Group>,
+  HelpText<"Enable PowerPC AS instructions">;
+def mno_ppcas : Flag<["-"], "mno-ppcas">, Group<m_ppc_Features_Group>;
 def mpcrel: Flag<["-"], "mpcrel">, Group<m_ppc_Features_Group>;
 def mno_pcrel: Flag<["-"], "mno-pcrel">, Group<m_ppc_Features_Group>;
 def mprefixed: Flag<["-"], "mprefixed">, Group<m_ppc_Features_Group>;
